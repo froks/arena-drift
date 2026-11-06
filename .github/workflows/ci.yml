@@ -40,7 +40,13 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # Compiled dependencies (registry + target/), one cache per OS. Only main writes
+      # the cache (PRs reuse it), and failed runs still save what they compiled.
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: native-${{ matrix.os }}
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # ALSA headers for sound; everything else Bevy needs is loaded at runtime.
       - name: Install Linux dependencies

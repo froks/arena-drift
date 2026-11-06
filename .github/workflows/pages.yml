@@ -29,7 +29,20 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
 
+      # Compiled dependencies (registry + target/). Separate key from the native CI
+      # builds; only main writes the cache, and failed runs still save it.
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: web
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Trunk downloads wasm-bindgen (matching Cargo.lock) and wasm-opt into ~/.cache/trunk.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/trunk
+          key: trunk-tools-${{ env.TRUNK_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: trunk-tools-${{ env.TRUNK_VERSION }}-
 
       - name: Install Trunk
         run: |
