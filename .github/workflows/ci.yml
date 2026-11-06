@@ -36,7 +36,7 @@ jobs:
             binary: arena-drift
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -59,7 +59,7 @@ jobs:
       - name: Test
         run: cargo test --release --locked
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: arena-drift-${{ runner.os }}
           path: target/release/${{ matrix.binary }}
