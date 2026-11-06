@@ -1,0 +1,19 @@
+[package]
+name = "arena-drift"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy = { version = "0.20.1", default-features = false, features = [
+    # Trimmed down so no gamepad/wayland dev packages are needed (audio needs libasound2-dev).
+    "default_app", "std", "multi_threaded", "bevy_winit", "x11", "default_font",
+    "2d_bevy_render", "ui_api", "ui_bevy_render", "bevy_state",
+    "bevy_audio", "wav",
+] }
+
+# Small optimizations for our code, full optimizations for dependencies (Bevy is slow in debug).
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
