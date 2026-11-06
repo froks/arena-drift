@@ -93,6 +93,36 @@ impl Obb {
     }
 }
 
+impl Obb {
+    /// Box vs circle. The normal points from the box towards the circle.
+    pub fn collide_circle(&self, center: Vec2, radius: f32) -> Option<Contact> {
+        let d = center - self.center;
+        if d.length() > self.bounding_radius() + radius {
+            return None;
+        }
+        let (lx, ly) = (d.dot(self.axes[0]), d.dot(self.axes[1]));
+        let inside = lx.abs() <= self.half.x && ly.abs() <= self.half.y;
+        if inside {
+            // Circle centre is inside the box: push out through the nearest face.
+            let (px, py) = (self.half.x - lx.abs(), self.half.y - ly.abs());
+            let (axis, sign, pen, along) = if px < py {
+                (0, lx.signum(), px, ly)
+            } else {
+                (1, ly.signum(), py, lx)
+            };
+            let normal = self.axes[axis] * sign;
+            let other = self.axes[1 - axis] * along;
+            let face = self.center + normal * self.half[axis] + other;
+            return Some(Contact { normal, depth: pen + radius, point: face });
+        }
+        let closest = self.closest_point(center);
+        let off = center - closest;
+        let dist = off.length();
+        (dist < radius).then(|| Contact { normal: off / dist, depth: radius - dist, point: closest })
+    }
+
+}
+
 /// Average of the corners furthest along `dir` (two when an edge is flush).
 fn deepest(corners: &[Vec2; 4], dir: Vec2) -> Vec2 {
     let max = corners.iter().map(|c| c.dot(dir)).fold(f32::MIN, f32::max);
@@ -140,6 +170,20 @@ mod tests {
         assert!((c.normal - Vec2::Y).length() < 1e-4, "{c:?}");
         assert!((c.depth - 2.0).abs() < 1e-3, "{c:?}");
         assert!((c.point.y - 15.0).abs() < 2.1 && c.point.x.abs() < 20.0, "{c:?}");
+    }
+
+    #[test]
+    fn box_vs_circle() {
+        let b = car(0.0, 0.0, 0.0); // 50 x 30
+        assert!(b.collide_circle(Vec2::new(40.0, 0.0), 10.0).is_none());
+        let c = b.collide_circle(Vec2::new(32.0, 0.0), 10.0).unwrap();
+        assert!((c.normal - Vec2::X).length() < 1e-4 && (c.depth - 3.0).abs() < 1e-3, "{c:?}");
+        // Corner hit pushes diagonally.
+        let c = b.collide_circle(Vec2::new(29.0, 19.0), 8.0).unwrap();
+        assert!(c.normal.x > 0.5 && c.normal.y > 0.5, "{c:?}");
+        // Centre inside the box: out through the nearest face (top, y = 15).
+        let c = b.collide_circle(Vec2::new(0.0, 12.0), 5.0).unwrap();
+        assert!((c.normal - Vec2::Y).length() < 1e-4 && (c.depth - 8.0).abs() < 1e-3, "{c:?}");
     }
 
     #[test]

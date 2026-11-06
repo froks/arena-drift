@@ -6,10 +6,18 @@
 
 use bevy::prelude::*;
 
+mod arena;
 mod cars;
 mod icons;
+mod minimap;
 mod physics;
 mod sound;
+
+use std::collections::VecDeque;
+
+use arena::{ARENAS, ArenaArt, ArenaDef, Explosive, Obstacle};
+use bevy::window::PrimaryWindow;
+use minimap::{Icon, MinimapPlugin};
 
 use cars::{CarArt, CarModel, MODELS, Paint};
 use icons::IconArt;
@@ -20,8 +28,10 @@ use sound::{Sfx, SoundPlugin, Sounds};
 // Tuning
 // ---------------------------------------------------------------------------
 
-const ARENA: Vec2 = Vec2::new(1200.0, 680.0);
-const WALL_THICKNESS: f32 = 16.0;
+const BARREL_BLAST: f32 = 110.0;
+const BARREL_DAMAGE: f32 = 38.0;
+/// Most skid-mark segments kept at once; the oldest fade out first.
+const MAX_SKIDS: usize = 1600;
 
 // Shared by all models; per-model handling lives in `cars::MODELS`.
 const BRAKE_FORCE: f32 = 900.0;
@@ -32,7 +42,6 @@ const WRECK_MASS: f32 = 2.5; // wrecks are heavier, so they act like obstacles
 const TURBO_MULTIPLIER: f32 = 1.9;
 
 const RESTITUTION: f32 = 0.6;
-const WALL_RESTITUTION: f32 = 0.4;
 /// Scales rotational inertia; higher = cars spin less from off-centre hits.
 const INERTIA_SCALE: f32 = 2.0;
 /// How quickly tyres kill collision-induced spin (per second).
@@ -295,6 +304,19 @@ struct Score {
 #[derive(Resource, Default)]
 struct PickupTimer(f32);
 
+/// Index into `arena::ARENAS` of the arena to fight in.
+#[derive(Resource, Default)]
+struct CurrentArena(usize);
+
+impl CurrentArena {
+    fn def(&self) -> &'static ArenaDef {
+        &ARENAS[self.0]
+    }
+}
+
+#[derive(Resource, Default)]
+struct SkidMarks(VecDeque<Entity>);
+
 /// Index into `cars::MODELS` of the player's car.
 #[derive(Resource, Default)]
 struct SelectedCar(usize);
@@ -355,6 +377,8 @@ struct Art {
     blast_mat: Handle<ColorMaterial>,
     smoke_mesh: Handle<Mesh>,
     smoke_mat: Handle<ColorMaterial>,
+    square: Handle<Mesh>,
+    skid_mat: Handle<ColorMaterial>,
 }
 
 /// Tiny xorshift RNG so we don't need an extra crate.
@@ -391,6 +415,7 @@ fn main() {
         clock: 0.0,
         total_time: 0.0,
     });
+    let arena = std::env::var("ARENA_DRIFT_ARENA").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
     let autostart = sim.is_some() || std::env::var_os("ARENA_DRIFT_AUTOSTART").is_some();
 
     let mut app = App::new();
@@ -405,11 +430,18 @@ fn main() {
             primary_window: Some(Window {
                 title: "Arena Drift".into(),
                 resolution: (1280, 800).into(),
+                // In the browser: draw into <canvas id="bevy"> and fill the page.
+                canvas: Some("#bevy".into()),
+                fit_canvas_to_parent: true,
+                // Keep keys like Tab and Space from scrolling or moving focus.
+                prevent_default_event_handling: true,
                 ..default()
             }),
             ..default()
         }))
-        .add_plugins(SoundPlugin)
+        .add_plugins((SoundPlugin, MinimapPlugin))
+        .insert_resource(CurrentArena(arena.min(ARENAS.len() - 1)))
+        .init_resource::<SkidMarks>()
         .insert_resource(ClearColor(Color::srgb(0.08, 0.08, 0.1)))
         .insert_resource(Rng(0x9E37_79B9))
         .init_resource::<Score>()
@@ -420,7 +452,9 @@ fn main() {
         .insert_state(if autostart { GameState::Playing } else { GameState::Garage })
         .init_resource::<CarArt>()
         .init_resource::<IconArt>()
+        .init_resource::<ArenaArt>()
         .add_systems(Startup, setup_world)
+        .add_systems(Update, dev_screenshot)
         .add_systems(OnEnter(GameState::Garage), setup_garage)
         .add_systems(Update, (garage_input, garage_animate).chain().run_if(in_state(GameState::Garage)))
         .add_systems(OnEnter(GameState::Playing), start_round)
@@ -431,14 +465,16 @@ fn main() {
                     player_input,
                     ai_drive,
                     car_physics,
-                    wall_collisions,
+                    static_collisions,
                     car_collisions,
+                    skid_marks,
                 )
                     .chain(),
                 (
                     fire_weapons,
                     move_projectiles,
                     update_mines,
+                    detonate_barrels,
                     resolve_blasts,
                     collect_pickups,
                     spawn_pickups,
@@ -461,6 +497,7 @@ fn main() {
                 icons::pulse_pickup_glow,
                 cars::steer_front_wheels,
                 draw_health_bars,
+                camera_follow.after(car_collisions),
             ),
         )
         .add_systems(OnEnter(GameState::GameOver), show_game_over)
@@ -472,40 +509,32 @@ fn main() {
 // Setup
 // ---------------------------------------------------------------------------
 
+/// Dev aid: `ARENA_DRIFT_SCREENSHOT=out.png:6` saves the game window to
+/// `out.png` after 6 seconds (wall-clock), once.
+fn dev_screenshot(mut commands: Commands, time: Res<Time<Real>>, mut done: Local<bool>) {
+    use bevy::render::view::screenshot::{Screenshot, save_to_disk};
+    if *done {
+        return;
+    }
+    let Some((path, secs)) = std::env::var("ARENA_DRIFT_SCREENSHOT")
+        .ok()
+        .and_then(|v| v.rsplit_once(':').map(|(p, s)| (p.to_string(), s.parse::<f32>().unwrap_or(5.0))))
+    else {
+        *done = true;
+        return;
+    };
+    if time.elapsed_secs() >= secs {
+        *done = true;
+        commands.spawn(Screenshot::primary_window()).observe(save_to_disk(path));
+    }
+}
+
 fn setup_world(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
 ) {
-    // Nudge the camera up so the arena sits below the HUD.
     commands.spawn((Camera2d, Transform::from_xyz(0.0, 24.0, 0.0)));
-
-    // Arena floor.
-    commands.spawn((
-        Mesh2d(meshes.add(Rectangle::new(ARENA.x, ARENA.y))),
-        MeshMaterial2d(materials.add(Color::srgb(0.22, 0.19, 0.16))),
-        Transform::from_xyz(0.0, 0.0, -10.0),
-    ));
-
-    // Walls.
-    let wall_mat = materials.add(Color::srgb(0.75, 0.6, 0.15));
-    let half = ARENA / 2.0 + WALL_THICKNESS / 2.0;
-    let horiz = meshes.add(Rectangle::new(ARENA.x + WALL_THICKNESS * 2.0, WALL_THICKNESS));
-    let vert = meshes.add(Rectangle::new(WALL_THICKNESS, ARENA.y));
-    for y in [-half.y, half.y] {
-        commands.spawn((
-            Mesh2d(horiz.clone()),
-            MeshMaterial2d(wall_mat.clone()),
-            Transform::from_xyz(0.0, y, -5.0),
-        ));
-    }
-    for x in [-half.x, half.x] {
-        commands.spawn((
-            Mesh2d(vert.clone()),
-            MeshMaterial2d(wall_mat.clone()),
-            Transform::from_xyz(x, 0.0, -5.0),
-        ));
-    }
 
     commands.insert_resource(Art {
         spark_mesh: meshes.add(Rectangle::new(4.0, 4.0)),
@@ -517,9 +546,12 @@ fn setup_world(
         blast_mat: materials.add(Color::srgba(1.0, 0.55, 0.15, 0.7)),
         smoke_mesh: meshes.add(Circle::new(1.0)),
         smoke_mat: materials.add(Color::srgba(0.35, 0.35, 0.37, 0.45)),
+        square: meshes.add(Rectangle::new(1.0, 1.0)),
+        skid_mat: materials.add(Color::srgba(0.05, 0.05, 0.05, 0.35)),
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_round(
     mut commands: Commands,
     mut materials: ResMut<Assets<ColorMaterial>>,
@@ -528,13 +560,20 @@ fn start_round(
     mut score: ResMut<Score>,
     mut pickup_timer: ResMut<PickupTimer>,
     mut blasts: ResMut<PendingBlasts>,
+    mut arena_art: ResMut<ArenaArt>,
+    mut skids: ResMut<SkidMarks>,
+    current: Res<CurrentArena>,
     sim: Option<Res<Sim>>,
     old: Query<Entity, With<RoundEntity>>,
 ) {
     for e in &old {
         commands.entity(e).despawn();
     }
+    skids.0.clear();
     *score = Score::default();
+    let def = current.def();
+    let obstacles = arena::spawn_arena(&mut commands, &mut arena_art, &mut materials, def);
+    minimap::spawn_minimap(&mut commands, def.size, RoundEntity);
     // The player's car first, then rivals from the same tier.
     let lineup = match &sim {
         Some(sim) => sim.lineup(),
@@ -548,7 +587,14 @@ fn start_round(
     let total = lineup.len();
     for (i, (&model_index, &color)) in lineup.iter().zip(&paints).enumerate() {
         let a = i as f32 / total as f32 * std::f32::consts::TAU + std::f32::consts::FRAC_PI_2;
-        let pos = Vec2::new(a.cos() * ARENA.x * 0.38, a.sin() * ARENA.y * 0.36);
+        // Start on an ellipse, pulled inwards until clear of obstacles.
+        let mut pos = Vec2::new(a.cos() * def.size.x * 0.38, a.sin() * def.size.y * 0.36);
+        for _ in 0..15 {
+            if obstacles.iter().all(|o| o.distance(pos) > 70.0) {
+                break;
+            }
+            pos *= 0.9;
+        }
         let heading = (-pos).to_angle();
         let model = &MODELS[model_index];
         let paint = cars::new_paint(&mut materials, model, color);
@@ -563,6 +609,12 @@ fn start_round(
             .id();
         cars::attach_car_visual(&mut commands, &car_art, model_index, &paint, root);
         commands.entity(root).insert(Car::new(model, heading, paint));
+        let is_player = i == 0 && sim.is_none();
+        commands.entity(root).insert(Icon {
+            color: if is_player { Color::WHITE } else { color },
+            size: Vec2::splat(if is_player { 110.0 } else { 80.0 }),
+            layer: 3,
+        });
 
         if i == 0 && sim.is_none() {
             commands.entity(root).insert(Player);
@@ -579,6 +631,9 @@ fn start_round(
         }
     }
 
+    if sim.is_some() {
+        return; // no player, no HUD
+    }
     commands.spawn((
         RoundEntity,
         Hud,
@@ -588,10 +643,12 @@ fn start_round(
             ..default()
         },
         TextColor(Color::WHITE),
+        BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.55)),
         Node {
             position_type: PositionType::Absolute,
             top: px(8),
             left: px(12),
+            padding: UiRect::axes(px(8), px(4)),
             ..default()
         },
     ));
@@ -608,7 +665,7 @@ struct GarageCar(usize);
 struct GarageInfo;
 
 const GARAGE_SPACING: f32 = 260.0;
-const GARAGE_Y: f32 = 95.0;
+const GARAGE_Y: f32 = 170.0;
 
 /// Where a model sits in the garage row of its tier.
 fn garage_slot(model: usize) -> f32 {
@@ -620,11 +677,25 @@ fn garage_slot(model: usize) -> f32 {
 fn setup_garage(
     mut commands: Commands,
     mut materials: ResMut<Assets<ColorMaterial>>,
+    mut meshes: ResMut<Assets<Mesh>>,
     car_art: Res<CarArt>,
     old: Query<Entity, With<RoundEntity>>,
 ) {
     for e in &old {
         commands.entity(e).despawn();
+    }
+
+    // Showroom floor.
+    for (size, color, z) in [
+        (Vec2::new(1232.0, 712.0), Color::srgb(0.75, 0.6, 0.15), -11.0),
+        (Vec2::new(1200.0, 680.0), Color::srgb(0.22, 0.19, 0.16), -10.0),
+    ] {
+        commands.spawn((
+            DespawnOnExit(GameState::Garage),
+            Mesh2d(meshes.add(Rectangle::from_size(size))),
+            MeshMaterial2d(materials.add(color)),
+            Transform::from_xyz(0.0, 0.0, z),
+        ));
     }
 
     for (i, model) in MODELS.iter().enumerate() {
@@ -683,9 +754,13 @@ fn stat_bar(value: f32, stat: impl Fn(&CarModel) -> f32) -> String {
 fn garage_input(
     keys: Res<ButtonInput<KeyCode>>,
     mut selected: ResMut<SelectedCar>,
+    mut current: ResMut<CurrentArena>,
     mut next: ResMut<NextState<GameState>>,
     mut info: Query<&mut Text, With<GarageInfo>>,
 ) {
+    if keys.just_pressed(KeyCode::Tab) {
+        current.0 = (current.0 + 1) % ARENAS.len();
+    }
     // Left/Right: car within the tier. Up/Down: tier (keeping the column).
     let tiers = cars::tiers();
     let row = cars::tier_models(MODELS[selected.0].tier);
@@ -717,7 +792,7 @@ fn garage_input(
     let handling = |m: &CarModel| m.turn_rate * 0.6 + m.grip * 0.4;
     let toughness = |m: &CarModel| m.max_hp * m.armor;
     text.0 = format!(
-        "TIER {}   <  {}  >\n{}\nRivals: {}\n\n\
+        "TIER {}   <  {}  >\n{}\nRivals: {}\n\nArena: {} ({:?})  -  Tab to change\n{}\n\n\
          Top speed  {}\n\
          Accel      {}\n\
          Handling   {}\n\
@@ -728,6 +803,9 @@ fn garage_input(
         m.name.to_uppercase(),
         m.blurb,
         cars::tier_models(m.tier).iter().map(|&i| MODELS[i].name).collect::<Vec<_>>().join(", "),
+        current.def().name.to_uppercase(),
+        current.def().mode,
+        current.def().blurb,
         stat_bar(m.top_speed, |m| m.top_speed),
         stat_bar(m.engine, |m| m.engine),
         stat_bar(handling(m), handling),
@@ -803,6 +881,7 @@ fn ai_drive(
     mut ais: Query<(Entity, &Transform, &mut Car, &mut Ai, &mut Armory)>,
     targets: Query<(Entity, &Transform, &Car, Has<Player>), Without<Ai>>,
     pickups: Query<(&Transform, &Pickup)>,
+    obstacles: Query<&Obstacle>,
 ) {
     let dt = time.delta_secs();
 
@@ -894,6 +973,28 @@ fn ai_drive(
         car.throttle = if diff.abs() < 1.2 { ai.aggression } else { 0.45 };
         car.handbrake = diff.abs() > 1.8 && speed > 150.0;
 
+        // Feelers: if something is in the way (and it isn't the target),
+        // steer towards whichever side is clear.
+        let look = 70.0 + speed * 0.35;
+        if goal.is_some() || tpos.distance(pos) > look {
+            let blocked = |dir: Vec2| {
+                obstacles
+                    .iter()
+                    .any(|o| o.distance(pos + dir * look) < 16.0 || o.distance(pos + dir * look * 0.5) < 16.0)
+            };
+            if blocked(fwd) {
+                let left = fwd.rotate(Vec2::from_angle(0.6));
+                let right = fwd.rotate(Vec2::from_angle(-0.6));
+                car.steer = match (blocked(left), blocked(right)) {
+                    (false, true) => 1.0,
+                    (true, false) => -1.0,
+                    (false, false) => if diff >= 0.0 { 1.0 } else { -1.0 },
+                    (true, true) => car.steer,
+                };
+                car.throttle = car.throttle.min(0.6);
+            }
+        }
+
         // Shoot when lined up.
         let to_target = tpos - pos;
         let dist = to_target.length();
@@ -970,61 +1071,99 @@ fn hurt(car: &mut Car, amount: f32, credit_player: bool, score: &mut Score) {
     }
 }
 
-fn wall_collisions(
+/// Cars against walls and obstacles (which never move).
+fn static_collisions(
     mut commands: Commands,
     art: Res<Art>,
     mut rng: ResMut<Rng>,
     mut sounds: ResMut<Sounds>,
-    mut q: Query<(&mut Transform, &mut Car, Has<Player>)>,
+    mut cars: Query<(&mut Transform, &mut Car, Has<Player>)>,
+    mut obstacles: Query<(&Obstacle, Option<&mut Explosive>)>,
 ) {
-    let half = ARENA / 2.0;
-    // Inward normal and the limit along it, for each wall.
-    let walls = [
-        (Vec2::X, -half.x),
-        (Vec2::NEG_X, -half.x),
-        (Vec2::Y, -half.y),
-        (Vec2::NEG_Y, -half.y),
-    ];
-    for (mut tf, mut car, is_player) in &mut q {
-        let mut impact = 0.0_f32;
-        let mut hit = None;
-        for (n, limit) in walls {
+    for (mut tf, mut car, is_player) in &mut cars {
+        let reach = car.model.size.length() / 2.0;
+        // (impact speed, damage factor, contact point, outward normal)
+        let mut worst: Option<(f32, f32, Vec2, Vec2)> = None;
+        for (o, explosive) in &mut obstacles {
             let pos = tf.translation.truncate();
-            // Deepest corner past this wall.
-            let corner = car
-                .obb(pos)
-                .corners()
-                .into_iter()
-                .min_by(|a, b| a.dot(n).total_cmp(&b.dot(n)))
-                .unwrap();
-            let depth = limit - corner.dot(n);
-            if depth <= 0.0 {
+            if o.pos.distance(pos) > o.bounding_radius() + reach {
                 continue;
             }
-            tf.translation += (n * depth).extend(0.0);
-            let r = corner - pos;
+            let Some(c) = o.collide_car(&car.obb(pos)) else { continue };
+            let n = -c.normal; // obstacle -> car
+            tf.translation += (n * c.depth).extend(0.0);
+            let r = c.point - pos;
             let vn = car.point_velocity(r).dot(n);
             if vn >= 0.0 {
                 continue;
             }
-            // Impulse at the corner: hitting a wall with a corner spins you.
+            // Impulse at the contact: clipping something with a corner spins you.
             let rn = cross(r, n);
-            let j = -(1.0 + WALL_RESTITUTION) * vn / (1.0 / car.mass() + rn * rn / car.inertia());
+            let j = -(1.0 + o.kind.restitution()) * vn / (1.0 / car.mass() + rn * rn / car.inertia());
             car.apply_impulse(n * j, r);
-            if -vn > impact {
-                impact = -vn;
-                hit = Some((corner + n * depth, n));
+
+            if let Some(mut barrel) = explosive {
+                barrel.hp -= (-vn - 60.0).max(0.0) * 0.08;
+                barrel.by_player |= is_player;
+            }
+            if worst.is_none_or(|(i, ..)| -vn > i) {
+                worst = Some((-vn, o.kind.damage(), c.point, n));
             }
         }
 
-        let Some((point, normal)) = hit else { continue };
+        let Some((impact, factor, point, normal)) = worst else { continue };
         if impact > 60.0 {
-            sounds.play(Sfx::Crash, (impact / 600.0) * if is_player { 1.0 } else { 0.5 });
+            let soft = 0.4 + 0.6 * factor.min(1.0);
+            sounds.play(Sfx::Crash, (impact / 600.0) * soft * if is_player { 1.0 } else { 0.5 });
         }
         if impact > DAMAGE_THRESHOLD * 1.5 && car.alive() {
-            let dmg = (impact - DAMAGE_THRESHOLD * 1.5) * WALL_DAMAGE_SCALE / car.model.armor;
+            let dmg = (impact - DAMAGE_THRESHOLD * 1.5) * WALL_DAMAGE_SCALE * factor / car.model.armor;
             car.hp -= dmg;
-            spawn_sparks(&mut commands, &art, &mut rng, point, normal.perp(), impact);
+            spawn_sparks(&mut commands, &art, &mut rng, point, normal.perp(), impact * factor.min(1.0));
+        }
+    }
+}
+
+/// Dark streaks behind the rear wheels when a car slides.
+fn skid_marks(
+    mut commands: Commands,
+    time: Res<Time>,
+    art: Res<Art>,
+    mut skids: ResMut<SkidMarks>,
+    cars: Query<(&Transform, &Car)>,
+) {
+    let dt = time.delta_secs();
+    for (tf, car) in &cars {
+        let speed = car.vel.length();
+        let fwd = car.forward();
+        let slide = car.vel.dot(fwd.perp()).abs();
+        if !car.alive() || !(slide > 110.0 || (car.handbrake && speed > 80.0)) {
+            continue;
+        }
+        let m = car.model;
+        let hl = m.size / 2.0;
+        let rear = m.look.axles[m.look.axles.len() - 1] * hl.x;
+        let pos = tf.translation.truncate();
+        for side in [-1.0, 1.0] {
+            let at = pos + fwd * rear + fwd.perp() * side * (hl.y - m.look.wheel.y * 0.2);
+            let mark = commands
+                .spawn((
+                    RoundEntity,
+                    Mesh2d(art.square.clone()),
+                    MeshMaterial2d(art.skid_mat.clone()),
+                    Transform::from_translation(at.extend(-9.0))
+                        .with_rotation(Quat::from_rotation_z(car.vel.to_angle()))
+                        .with_scale(Vec3::new(speed * dt + 2.0, m.look.wheel.y * 0.8, 1.0)),
+                ))
+                .id();
+            skids.0.push_back(mark);
+        }
+    }
+    while skids.0.len() > MAX_SKIDS {
+        if let Some(old) = skids.0.pop_front()
+            && let Ok(mut e) = commands.get_entity(old)
+        {
+            e.despawn();
         }
     }
 }
@@ -1192,9 +1331,11 @@ fn move_projectiles(
     mut sounds: ResMut<Sounds>,
     mut shots: Query<(Entity, &mut Transform, &mut Projectile), Without<Car>>,
     mut cars: Query<(Entity, &Transform, &mut Car, Has<Player>)>,
+    mut obstacles: Query<(&Obstacle, Option<&mut Explosive>)>,
+    current: Res<CurrentArena>,
 ) {
     let dt = time.delta_secs();
-    let half = ARENA / 2.0;
+    let half = current.def().size / 2.0;
 
     for (e, mut tf, mut shot) in &mut shots {
         shot.life -= dt;
@@ -1216,7 +1357,14 @@ fn move_projectiles(
         let pos = tf.translation.truncate();
 
         // What did it hit?
-        let hit_wall = pos.x.abs() > half.x || pos.y.abs() > half.y;
+        let out_of_bounds = pos.x.abs() > half.x + 200.0 || pos.y.abs() > half.y + 200.0;
+        let mut hit_wall = None;
+        for (o, explosive) in &mut obstacles {
+            if o.pos.distance(pos) <= o.bounding_radius() + 2.0 && o.distance(pos) <= 0.5 {
+                hit_wall = Some(explosive);
+                break;
+            }
+        }
         let mut hit_car = None;
         for (ce, ctf, car, is_player) in &mut cars {
             if ce != shot.owner && car.obb(ctf.translation.truncate()).distance(pos) < 2.0 {
@@ -1225,7 +1373,7 @@ fn move_projectiles(
             }
         }
 
-        if hit_car.is_none() && !hit_wall && shot.life > 0.0 {
+        if hit_car.is_none() && hit_wall.is_none() && !out_of_bounds && shot.life > 0.0 {
             continue;
         }
         commands.entity(e).despawn();
@@ -1238,7 +1386,11 @@ fn move_projectiles(
                     let push = 25.0 / car.mass();
                     car.vel += shot.vel.normalize_or_zero() * push;
                     spawn_sparks(&mut commands, &art, &mut rng, pos, -shot.vel.normalize_or_zero(), 30.0);
-                } else if hit_wall {
+                } else if let Some(explosive) = hit_wall {
+                    if let Some(mut barrel) = explosive {
+                        barrel.hp -= 4.0;
+                        barrel.by_player = shot.by_player;
+                    }
                     spawn_sparks(&mut commands, &art, &mut rng, pos, -shot.vel.normalize_or_zero(), 20.0);
                 }
             }
@@ -1285,6 +1437,20 @@ fn update_mines(
     }
 }
 
+fn detonate_barrels(
+    mut commands: Commands,
+    mut blasts: ResMut<PendingBlasts>,
+    barrels: Query<(Entity, &Obstacle, &Explosive)>,
+) {
+    for (e, o, barrel) in &barrels {
+        if barrel.hp <= 0.0 {
+            commands.entity(e).despawn();
+            blasts.0.push(Blast { pos: o.pos, radius: BARREL_BLAST, damage: BARREL_DAMAGE, by_player: barrel.by_player });
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn resolve_blasts(
     mut commands: Commands,
     art: Res<Art>,
@@ -1293,9 +1459,18 @@ fn resolve_blasts(
     mut blasts: ResMut<PendingBlasts>,
     mut sounds: ResMut<Sounds>,
     mut cars: Query<(&Transform, &mut Car, Has<Player>)>,
+    mut barrels: Query<(&Obstacle, &mut Explosive)>,
 ) {
     for blast in blasts.0.drain(..) {
         sounds.play(Sfx::Explosion, 0.9);
+        // Barrels caught in a blast go off next frame: chain reactions.
+        for (o, mut barrel) in &mut barrels {
+            let d = o.distance(blast.pos);
+            if d < blast.radius {
+                barrel.hp -= blast.damage * (1.0 - d / blast.radius);
+                barrel.by_player = blast.by_player;
+            }
+        }
         for (tf, mut car, is_player) in &mut cars {
             let center = tf.translation.truncate();
             let d = car.obb(center).distance(blast.pos);
@@ -1337,6 +1512,8 @@ fn spawn_pickups(
     mut timer: ResMut<PickupTimer>,
     existing: Query<(), With<Pickup>>,
     cars: Query<&Transform, With<Car>>,
+    obstacles: Query<&Obstacle>,
+    current: Res<CurrentArena>,
 ) {
     timer.0 -= time.delta_secs();
     if timer.0 > 0.0 {
@@ -1361,17 +1538,23 @@ fn spawn_pickups(
     let kind = PickupKind::ALL[index];
 
     // Find a spot not right on top of a car.
-    let margin = ARENA / 2.0 - Vec2::splat(60.0);
+    let margin = current.def().size / 2.0 - Vec2::splat(80.0);
     let mut pos = Vec2::ZERO;
-    for _ in 0..12 {
+    for _ in 0..30 {
         pos = Vec2::new(rng.range(-margin.x, margin.x), rng.range(-margin.y, margin.y));
-        if cars.iter().all(|t| t.translation.truncate().distance(pos) > 90.0) {
+        let clear_of_cars = cars.iter().all(|t| t.translation.truncate().distance(pos) > 90.0);
+        if clear_of_cars && obstacles.iter().all(|o| o.distance(pos) > 40.0) {
             break;
         }
     }
 
     let pickup = commands
-        .spawn((RoundEntity, Pickup(kind), Transform::from_translation(pos.extend(-3.0))))
+        .spawn((
+            RoundEntity,
+            Pickup(kind),
+            Icon { color: kind.color(), size: Vec2::splat(60.0), layer: 2 },
+            Transform::from_translation(pos.extend(-3.0)),
+        ))
         .id();
     icons::attach_pickup_icon(&mut commands, &icon_art, index, pickup);
 }
@@ -1468,10 +1651,10 @@ fn update_car_visuals(
     mut rng: ResMut<Rng>,
     mut materials: ResMut<Assets<ColorMaterial>>,
     mut sounds: ResMut<Sounds>,
-    mut q: Query<(&Transform, &mut Car)>,
+    mut q: Query<(&Transform, &mut Car, Option<&mut Icon>)>,
 ) {
     let charred = Color::srgb(0.2, 0.17, 0.15);
-    for (tf, mut car) in &mut q {
+    for (tf, mut car, icon) in &mut q {
         let health = car.health();
         let mix = if car.alive() { 0.35 + 0.65 * health } else { 0.12 };
         for (handle, base) in car.paint.handles.iter().zip(car.paint.colors) {
@@ -1485,6 +1668,10 @@ fn update_car_visuals(
         if !car.alive() && !car.wrecked {
             car.wrecked = true;
             sounds.play(Sfx::Wreck, 1.0);
+            if let Some(mut icon) = icon {
+                icon.color = Color::srgb(0.3, 0.3, 0.3);
+                icon.layer = 2;
+            }
         }
 
         // Smoke: thicker the worse the damage; wrecks smoulder.
@@ -1593,6 +1780,52 @@ fn update_explosions(
         let size = ex.radius * t.sqrt() * (1.0 - t * t);
         tf.scale = Vec3::splat(size.max(1.0));
     }
+}
+
+/// Follow the player with a little look-ahead, zoom out with speed, and stay
+/// inside the arena. Without a player (balance sims) show the whole arena.
+#[allow(clippy::type_complexity)]
+fn camera_follow(
+    time: Res<Time>,
+    state: Res<State<GameState>>,
+    current: Res<CurrentArena>,
+    window: Single<&Window, With<PrimaryWindow>>,
+    player: Query<(&Transform, &Car), (With<Player>, Without<Camera2d>)>,
+    camera: Single<(&mut Transform, &mut Projection), With<Camera2d>>,
+) {
+    let (mut tf, mut projection) = camera.into_inner();
+    let Projection::Orthographic(ortho) = &mut *projection else { return };
+    let view = Vec2::new(window.width(), window.height());
+
+    if *state.get() == GameState::Garage {
+        // The showroom is laid out for 1280x800; fit it to whatever the window is.
+        tf.translation = Vec3::new(0.0, 24.0, tf.translation.z);
+        ortho.scale = (Vec2::new(1280.0, 800.0) / view).max_element().max(1.0);
+        return;
+    }
+
+    let arena = current.def().size;
+    let (target, zoom) = match player.single() {
+        Ok((ptf, car)) => {
+            let speed = car.vel.length();
+            (ptf.translation.truncate() + car.vel * 0.3, 1.0 + (speed / 800.0).min(1.0) * 0.2)
+        }
+        Err(_) => {
+            let fit = ((arena + Vec2::splat(200.0)) / view).max_element();
+            (Vec2::new(0.0, 30.0 * fit), fit)
+        }
+    };
+
+    let k = 1.0 - (-4.0 * time.delta_secs()).exp();
+    ortho.scale += (zoom - ortho.scale) * k;
+    let mut pos = tf.translation.truncate();
+    pos += (target - pos) * k;
+
+    // Don't show more than a strip of the outfield.
+    let room = arena / 2.0 + Vec2::splat(160.0) - view / 2.0 * ortho.scale;
+    pos.x = if room.x > 0.0 { pos.x.clamp(-room.x, room.x) } else { 0.0 };
+    pos.y = if room.y > 0.0 { pos.y.clamp(-room.y, room.y) } else { 0.0 };
+    tf.translation = pos.extend(tf.translation.z);
 }
 
 fn update_hud(
