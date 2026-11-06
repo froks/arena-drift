@@ -583,19 +583,10 @@ fn start_round(
     pickup_timer.0 = 1.0; // first power-up shows up quickly
     blasts.0.clear();
 
-    // Cars start on an ellipse, all facing the centre.
+    // Fair starting grid: open road ahead of every car, no barrels next to anyone.
     let total = lineup.len();
-    for (i, (&model_index, &color)) in lineup.iter().zip(&paints).enumerate() {
-        let a = i as f32 / total as f32 * std::f32::consts::TAU + std::f32::consts::FRAC_PI_2;
-        // Start on an ellipse, pulled inwards until clear of obstacles.
-        let mut pos = Vec2::new(a.cos() * def.size.x * 0.38, a.sin() * def.size.y * 0.36);
-        for _ in 0..15 {
-            if obstacles.iter().all(|o| o.distance(pos) > 70.0) {
-                break;
-            }
-            pos *= 0.9;
-        }
-        let heading = (-pos).to_angle();
+    let (grid, _) = arena::spawn_points(&obstacles, def.size, total);
+    for (i, ((&model_index, &color), &(pos, heading))) in lineup.iter().zip(&paints).zip(&grid).enumerate() {
         let model = &MODELS[model_index];
         let paint = cars::new_paint(&mut materials, model, color);
 

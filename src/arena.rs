@@ -533,6 +533,53 @@ fn timberland(l: &mut Layout) {
 }
 
 // ---------------------------------------------------------------------------
+// Starting grid
+// ---------------------------------------------------------------------------
+
+/// How much open road a car gets in front of it at the start.
+pub const SPAWN_RUNWAY: f32 = 300.0;
+
+/// Is this a fair place to start: not on top of anything, not next to a
+/// barrel, and with open road towards the centre?
+fn fair_spawn(obstacles: &[Obstacle], pos: Vec2, heading: f32) -> bool {
+    let dir = Vec2::from_angle(heading);
+    obstacles.iter().all(|o| {
+        let keep_away = if o.kind == ObstacleKind::Barrel { 140.0 } else { 70.0 };
+        o.distance(pos) > keep_away
+            && (1..=(SPAWN_RUNWAY / 20.0) as i32).all(|k| o.distance(pos + dir * (k as f32 * 20.0)) > 30.0)
+    })
+}
+
+/// Starting positions (and headings, facing the centre) for `count` cars,
+/// spread around a ring. Each spot slides around the ring and inwards until
+/// it's fair; the bool says whether every car got a fair spot.
+pub fn spawn_points(obstacles: &[Obstacle], size: Vec2, count: usize) -> (Vec<(Vec2, f32)>, bool) {
+    let mut points: Vec<(Vec2, f32)> = Vec::new();
+    let mut all_fair = true;
+    for i in 0..count {
+        let base = i as f32 / count as f32 * TAU + FRAC_PI_2;
+        let candidates = [1.0_f32, 0.9, 0.8, 0.7].into_iter().flat_map(|radius| {
+            (0..11).map(move |k| {
+                // 0, +0.1, -0.1, +0.2, -0.2, ... radians around the ring.
+                let off = ((k + 1) / 2) as f32 * 0.1 * if k % 2 == 1 { 1.0 } else { -1.0 };
+                let a = base + off;
+                Vec2::new(a.cos() * size.x * 0.38, a.sin() * size.y * 0.36) * radius
+            })
+        });
+        let spaced = |p: Vec2, points: &[(Vec2, f32)]| points.iter().all(|(q, _)| q.distance(p) > 160.0);
+        let fair = candidates
+            .clone()
+            .find(|&p| spaced(p, &points) && fair_spawn(obstacles, p, (-p).to_angle()));
+        let pos = fair.unwrap_or_else(|| {
+            all_fair = false;
+            candidates.clone().next().unwrap()
+        });
+        points.push((pos, (-pos).to_angle()));
+    }
+    (points, all_fair)
+}
+
+// ---------------------------------------------------------------------------
 // Drawing
 // ---------------------------------------------------------------------------
 
@@ -865,6 +912,26 @@ mod tests {
                 .count();
             assert!(blocked < 5, "{}: centre line mostly blocked", def.name);
         }
+    }
+
+    #[test]
+    fn every_car_starts_with_open_road() {
+        for def in &ARENAS {
+            let layout = Layout::new(def);
+            let (points, all_fair) = spawn_points(&layout.obstacles, def.size, 6);
+            assert!(all_fair, "{}: some car has no fair start: {points:?}", def.name);
+        }
+    }
+
+    #[test]
+    fn old_dust_bowl_player_start_is_rejected() {
+        // Where the player used to start: nose-first into a concrete block,
+        // barrels right behind.
+        let layout = Layout::new(&ARENAS[0]);
+        let old = Vec2::new(0.0, 437.0);
+        assert!(!fair_spawn(&layout.obstacles, old, (-old).to_angle()));
+        let (points, _) = spawn_points(&layout.obstacles, ARENAS[0].size, 6);
+        assert!(points[0].0.distance(old) > 50.0, "player still starts at {:?}", points[0].0);
     }
 
     #[test]
