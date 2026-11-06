@@ -1,9 +1,14 @@
 # Arena Drift
 
+[![CI](https://github.com/froks/arena-drift/actions/workflows/ci.yml/badge.svg)](https://github.com/froks/arena-drift/actions/workflows/ci.yml)
+[![Web build](https://github.com/froks/arena-drift/actions/workflows/pages.yml/badge.svg)](https://github.com/froks/arena-drift/actions/workflows/pages.yml)
+
 A top-down demolition derby written in Rust with [Bevy](https://bevy.org). Pick a car, drive into the arena,
 and wreck your rivals until you're the last one still running.
 
-**▶ [Play in your browser](https://froks.github.io/arena-drift/)**, or build it yourself (see below).
+**▶ [Play in your browser](https://froks.github.io/arena-drift/)**, download a build for Linux, Windows or macOS
+from the latest [CI run](https://github.com/froks/arena-drift/actions/workflows/ci.yml) (under *Artifacts*), or
+build it yourself (see below).
 
 ![Dust Bowl, close-up](docs/screenshots/dust-bowl.png)
 
@@ -155,6 +160,7 @@ SIM   T2 Razorback    11 wins / 120 cars entered =   9.2% per car (fair 16.7%)
 | `src/sound.rs` | Synthesised sound effects and the engine loop |
 | `index.html` | Web page for the browser build (Trunk entry point) |
 | `.github/workflows/pages.yml` | Builds the web version and deploys it to GitHub Pages |
+| `.github/workflows/ci.yml` | Builds and tests on Linux, Windows and macOS, and uploads the binaries |
 
 ### Adding content
 

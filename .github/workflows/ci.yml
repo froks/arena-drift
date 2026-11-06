@@ -1,0 +1,60 @@
+# Native builds and tests on Linux, Windows and macOS.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same branch / PR.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+            binary: arena-drift
+          - name: Windows
+            os: windows-latest
+            binary: arena-drift.exe
+          - name: macOS
+            os: macos-latest
+            binary: arena-drift
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # ALSA headers for sound; everything else Bevy needs is loaded at runtime.
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libasound2-dev
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Test
+        run: cargo test --release --locked
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arena-drift-${{ runner.os }}
+          path: target/release/${{ matrix.binary }}
+          if-no-files-found: error
