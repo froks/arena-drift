@@ -21,9 +21,14 @@ build it yourself (see below).
   brake for corners, take the inside line, overtake and detour for power-ups near the racing line. They still shoot
   whoever is in front of them.
 - **3 race tracks:**
-  - *Dustline Speedway:* fast sweepers round a dusty oval with a kink on the back straight (4 laps).
-  - *Red Canyon:* long and technical, with a hairpin that drops into a canyon (3 laps).
-  - *Pine Ridge:* through the woods and over the hills, with an S-bend on the far side (4 laps).
+  - *Dustline Speedway:* fast sweepers round a dusty oval with a kink on the back straight, and a ramp that
+    throws you into the air (4 laps).
+  - *Red Canyon:* long and technical, with a hairpin that drops into a canyon and a jump over a ravine. Hit the
+    boost pad and the ramp flat out, or fall in and lose time (3 laps).
+  - *Pine Ridge:* through the woods and over the hills. A river crosses the track twice: once on a bridge and once
+    through a shallow ford that slows you down (4 laps).
+- **Track features:** boost pads give a kick and a moment of turbo. Cars fly off ramps and land where physics puts
+  them. If you fall into a ravine or the river, or land beside the track, you're put back on the track.
 - **Drifty car handling.** Cars slide sideways, and the handbrake kicks the tail out. Collisions use rotated
   boxes, so a hit on a corner spins the car round.
 - **Damage that depends on the hit.** Ramming nose-first hurts the other car more than you, and taking a hit in
@@ -157,7 +162,8 @@ The tests cover:
   same every time.
 - Race tracks: no part of a track comes close to another part, corners are wider than the track, the track fits
   its arena, the grid is behind the line, scenery stays off the track, and lap progress is measured correctly
-  across the start line.
+  across the start line. Boost pads are on the track and ramps on straights, ravines are deep enough to need a
+  jump, the bridge stays dry, the ford is shallow, and nothing else is under water.
 - Engine sound: the loops repeat without a click, and the revs drop on gear changes.
 
 ## Developer options
@@ -171,6 +177,7 @@ These environment variables help with testing and balancing:
 | `ARENA_DRIFT_SIM=<rounds>` | Balance simulation: AI-only rounds at 3× speed with sound off. Prints each round's winner and a win table at the end. On a track it also prints every car's finishing time and best lap. |
 | `ARENA_DRIFT_SIM_TIER=<t>` | With `ARENA_DRIFT_SIM`, fill the field with one tier's cars only. |
 | `ARENA_DRIFT_SCREENSHOT=<file>:<secs>` | Save a screenshot of the game window after `secs` seconds. |
+| `ARENA_DRIFT_LOOK=<x>,<y>,<zoom>` | With `ARENA_DRIFT_SIM`, point the camera at that spot instead of showing the whole arena. |
 
 For example, to check balance within tier 2 on the Junkyard:
 
@@ -195,7 +202,7 @@ SIM   T2 Razorback    11 wins / 120 cars entered =   9.2% per car (fair 16.7%)
 | `src/cars.rs` | Car models (stats and looks), tier line-ups, building car visuals from shapes |
 | `src/arena.rs` | Arena and track definitions, layouts, obstacles, decorations, and drawing them |
 | `src/track.rs` | Race tracks: the centreline spline, barriers, the starting grid and lap progress |
-| `src/terrain.rs` | Ground relief, the ground mesh and its painted texture |
+| `src/terrain.rs` | Ground relief, cuts (ravines, rivers) and decks (ramps, bridges, fords), the ground mesh and its painted texture |
 | `src/physics.rs` | Oriented-box collision geometry |
 | `src/icons.rs` | Power-up badges, rockets and mines |
 | `src/minimap.rs` | The corner minimap |
@@ -212,7 +219,7 @@ SIM   T2 Razorback    11 wins / 120 cars entered =   9.2% per car (fair 16.7%)
 - **An arena:** add an `ArenaDef` to `ARENAS` in `src/arena.rs` with a size, a theme and a `build` function that
   places obstacles and decorations using the `Layout` helpers.
 - **A race track:** add a `TrackDef` in `src/track.rs` (control points of a closed loop in driving order, with the
-  start line on the first point), then an `ArenaDef` with `mode: Mode::Race(&YOUR_TRACK)` whose `build` function
+  start line on the first point, and its `features`: boost pads, ramps, jumps and a river), then an `ArenaDef` with `mode: Mode::Race(&YOUR_TRACK)` whose `build` function
   places the scenery. The track tests check that the track never comes close to itself, its corners aren't too
   tight, and it fits the arena size. Run a sim (`ARENA_DRIFT_SIM=3 ARENA_DRIFT_ARENA=<n>`) to see that the AI gets
   round.

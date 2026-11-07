@@ -1,9 +1,15 @@
 //! Ground relief. Every arena has a height function; gameplay stays on the
 //! XY plane and Z is "up". The ground is a lit mesh built from the height
 //! function, with flat markings (patches, oil, paint) baked into its texture.
+//!
+//! Race tracks add to that: [`Cut`]s carve ravines and river channels into
+//! the ground, [`Deck`]s are surfaces cars drive on above (or below) it —
+//! ramps, bridges, fords — and there can be water.
 
 use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, PrimitiveTopology};
+use std::sync::Arc;
+
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 
@@ -19,11 +25,72 @@ const MAX_TEXTURE: f32 = 2048.0;
 /// How much steeper than real the ground looks in its lighting.
 const HILLSHADE: f32 = 3.0;
 
+/// A trench carved into the ground along a line segment.
+#[derive(Clone, Copy, Debug)]
+pub struct Cut {
+    pub a: Vec2,
+    pub b: Vec2,
+    /// Half width of the flat bottom.
+    pub half_width: f32,
+    /// How far the sides spread beyond that (steep for a ravine, gentle for a river).
+    pub bank: f32,
+    pub depth: f32,
+}
+
+impl Cut {
+    pub fn distance(&self, p: Vec2) -> f32 {
+        let ab = self.b - self.a;
+        let t = ((p - self.a).dot(ab) / ab.length_squared()).clamp(0.0, 1.0);
+        p.distance(self.a + ab * t)
+    }
+    /// How much lower the ground is at `p` because of this cut.
+    pub fn amount(&self, p: Vec2) -> f32 {
+        self.depth * (1.0 - smoothstep(self.half_width, self.half_width + self.bank, self.distance(p)))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeckKind {
+    Ramp,
+    Bridge,
+    Ford,
+}
+
+/// A driving surface that isn't the ground: a rectangle along `dir`, whose
+/// height runs from `h0` at the back to `h1` at the front, dipping by `sag`
+/// in the middle (negative arches it up).
+#[derive(Clone, Copy, Debug)]
+pub struct Deck {
+    pub kind: DeckKind,
+    pub center: Vec2,
+    pub dir: Vec2,
+    pub half: Vec2,
+    pub h0: f32,
+    pub h1: f32,
+    pub sag: f32,
+}
+
+impl Deck {
+    /// Position along the deck (0 at the back, 1 at the front), if `p` is on it.
+    fn along(&self, p: Vec2) -> Option<f32> {
+        let d = p - self.center;
+        let (x, y) = (d.dot(self.dir), d.dot(self.dir.perp()));
+        (x.abs() <= self.half.x && y.abs() <= self.half.y).then(|| (x / self.half.x + 1.0) / 2.0)
+    }
+    pub fn height_at(&self, t: f32) -> f32 {
+        self.h0 + (self.h1 - self.h0) * t - self.sag * (std::f32::consts::PI * t).sin()
+    }
+}
+
 /// The current ground: a height for every point on the XY plane.
-#[derive(Resource, Clone, Copy)]
+#[derive(Resource, Clone)]
 pub struct Terrain {
     relief: fn(Vec2, Vec2) -> f32,
     size: Vec2,
+    cuts: Arc<[Cut]>,
+    decks: Arc<[Deck]>,
+    /// Water: its surface height and the channel it fills.
+    pub water: Option<(f32, Cut)>,
 }
 
 fn flat(_: Vec2, _: Vec2) -> f32 {
@@ -32,13 +99,54 @@ fn flat(_: Vec2, _: Vec2) -> f32 {
 
 impl Default for Terrain {
     fn default() -> Self {
-        Self { relief: flat, size: Vec2::ONE }
+        Self::new(flat, Vec2::ONE)
     }
 }
 
 impl Terrain {
     pub fn new(relief: fn(Vec2, Vec2) -> f32, size: Vec2) -> Self {
-        Self { relief, size }
+        Self { relief, size, cuts: Arc::new([]), decks: Arc::new([]), water: None }
+    }
+
+    pub fn with_cuts(mut self, cuts: Vec<Cut>) -> Self {
+        self.cuts = cuts.into();
+        self
+    }
+
+    pub fn with_decks(mut self, decks: Vec<Deck>) -> Self {
+        self.decks = decks.into();
+        self
+    }
+
+    pub fn decks(&self) -> &[Deck] {
+        &self.decks
+    }
+
+    /// Height of the ground itself (what the ground mesh shows). It stays a
+    /// little under any deck, so it never pokes up through a bridge.
+    pub fn ground(&self, p: Vec2) -> f32 {
+        let ground = (self.relief)(p, self.size) - self.cuts.iter().map(|c| c.amount(p)).sum::<f32>();
+        self.decks.iter().filter_map(|d| d.along(p).map(|t| d.height_at(t) - 3.0)).fold(ground, f32::min)
+    }
+
+    /// How deep the cuts are at `p` (0 outside them).
+    pub fn cut_depth(&self, p: Vec2) -> f32 {
+        self.cuts.iter().map(|c| c.amount(p)).sum()
+    }
+
+    /// Whether `p` is on a deck (ramp, bridge, ford) rather than the ground.
+    pub fn on_deck(&self, p: Vec2) -> bool {
+        self.decks.iter().any(|d| d.along(p).is_some())
+    }
+
+    /// How deep the water is at `p` (0 when dry).
+    pub fn water_depth(&self, p: Vec2) -> f32 {
+        match self.water {
+            Some((level, channel)) if channel.distance(p) < channel.half_width + channel.bank => {
+                (level - self.height(p)).max(0.0)
+            }
+            _ => 0.0,
+        }
     }
 
     /// Size of the arena inside the walls.
@@ -46,8 +154,15 @@ impl Terrain {
         self.size
     }
 
+    /// Height of whatever cars drive on at `p`: a deck if there is one,
+    /// otherwise the ground.
     pub fn height(&self, p: Vec2) -> f32 {
-        (self.relief)(p, self.size)
+        for d in self.decks.iter() {
+            if let Some(t) = d.along(p) {
+                return d.height_at(t);
+            }
+        }
+        self.ground(p)
     }
 
     /// Uphill direction, scaled by steepness (rise per unit).
@@ -230,11 +345,16 @@ pub fn build_ground(
     for j in 0..=ny {
         for i in 0..=nx {
             let p = min + Vec2::new(i as f32 / nx as f32, j as f32 / ny as f32) * extent;
-            let h = terrain.height(p);
+            let h = terrain.ground(p);
             positions.push([p.x, p.y, h]);
             // Shade as if slopes were steeper than they are, so the relief
             // reads from straight above (a hillshade, like on a map).
-            let g = terrain.gradient(p) * HILLSHADE;
+            const E: f32 = 4.0;
+            let slope = Vec2::new(
+                terrain.ground(p + Vec2::X * E) - terrain.ground(p - Vec2::X * E),
+                terrain.ground(p + Vec2::Y * E) - terrain.ground(p - Vec2::Y * E),
+            ) / (2.0 * E);
+            let g = slope * HILLSHADE;
             normals.push(Vec3::new(-g.x, -g.y, 1.0).normalize().to_array());
             uvs.push([i as f32 / nx as f32, 1.0 - j as f32 / ny as f32]);
             // Hollows a touch darker, high ground a touch lighter.

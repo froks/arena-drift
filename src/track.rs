@@ -5,6 +5,33 @@
 
 use bevy::prelude::*;
 
+use crate::terrain::{Cut, Deck, DeckKind, Terrain};
+
+/// Something along a track. Positions are fractions of a lap from the line.
+#[derive(Clone, Copy, Debug)]
+pub enum Feature {
+    /// A pad that gives a burst of turbo; `lateral` is its offset across the track.
+    Boost { at: f32, lateral: f32 },
+    /// A ramp across the track that throws cars into the air.
+    Ramp { at: f32 },
+    /// A ramp in front of a ravine cut across the track: jump it or fall in.
+    Jump { at: f32 },
+    /// A river crossing the track twice: once on a bridge, once through a ford.
+    River { bridge: f32, ford: f32 },
+}
+
+/// How tall a ramp's lip is, and how long its slope.
+pub const RAMP_HEIGHT: f32 = 26.0;
+pub const RAMP_LENGTH: f32 = 110.0;
+/// Width of the gap a jump has to clear.
+pub const RAVINE_GAP: f32 = 130.0;
+/// The river channel: flat bottom, banks and depth.
+const RIVER_HALF: f32 = 70.0;
+const RIVER_BANK: f32 = 90.0;
+const RIVER_DEPTH: f32 = 95.0;
+/// A boost pad's size (along, across).
+pub const BOOST_PAD: Vec2 = Vec2::new(70.0, 56.0);
+
 /// A track as authored: control points of a closed loop, in driving order.
 /// The start/finish line sits on the first point, with the grid behind it.
 pub struct TrackDef {
@@ -14,6 +41,7 @@ pub struct TrackDef {
     pub asphalt: Color,
     /// Alternating kerb colours on the edges.
     pub kerbs: [Color; 2],
+    pub features: &'static [Feature],
 }
 
 /// How far apart centreline samples are.
@@ -33,6 +61,7 @@ pub struct Track {
     pub length: f32,
     pub width: f32,
     pub laps: u32,
+    pub features: &'static [Feature],
 }
 
 /// Where something is relative to the track.
@@ -91,7 +120,15 @@ impl Track {
                 a.angle_to(b) / (4.0 * step)
             })
             .collect();
-        Self { points, dirs, curvature, length: count as f32 * step, width: def.width, laps: def.laps }
+        Self {
+            points,
+            dirs,
+            curvature,
+            length: count as f32 * step,
+            width: def.width,
+            laps: def.laps,
+            features: def.features,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -172,8 +209,166 @@ impl Track {
         self.locate(p, None).lateral.abs()
     }
 
-    /// Barrier boxes along both edges: (centre, rotation, size).
+    /// Where along the track (in distance) a lap fraction is.
+    pub fn at(&self, fraction: f32) -> f32 {
+        fraction * self.length
+    }
+
+    /// Distance along the track of every jump's ravine.
+    pub fn jumps(&self) -> Vec<f32> {
+        self.features
+            .iter()
+            .filter_map(|f| match *f {
+                Feature::Jump { at } => Some(self.at(at)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Ramp lips: distance along the track where cars take off.
+    pub fn ramps(&self) -> Vec<f32> {
+        self.features
+            .iter()
+            .filter_map(|f| match *f {
+                Feature::Jump { at } => Some(self.at(at) - RAVINE_GAP / 2.0),
+                Feature::Ramp { at } => Some(self.at(at)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Boost pads: (centre, direction).
+    pub fn boosts(&self) -> Vec<(Vec2, Vec2)> {
+        self.features
+            .iter()
+            .filter_map(|f| match *f {
+                Feature::Boost { at, lateral } => {
+                    let s = self.at(at);
+                    Some((self.point_at(s) + self.dir_at(s).perp() * lateral, self.dir_at(s)))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The river's course: a long line through both crossings.
+    fn river(&self) -> Option<(Vec2, Vec2, f32, f32)> {
+        self.features.iter().find_map(|f| match *f {
+            Feature::River { bridge, ford } => {
+                let (a, b) = (self.point_at(self.at(bridge)), self.point_at(self.at(ford)));
+                let dir = (b - a).normalize();
+                Some((a - dir * 3000.0, b + dir * 3000.0, self.at(bridge), self.at(ford)))
+            }
+            _ => None,
+        })
+    }
+
+    /// The bridge and the ford: (kind, start, end) along the track.
+    /// Each runs until the whole width of the road is clear of the river
+    /// channel, however slanted the crossing is.
+    pub fn crossings(&self) -> Vec<(DeckKind, f32, f32)> {
+        let Some((a, b, bridge, ford)) = self.river() else { return Vec::new() };
+        let channel = river_cut(a, b);
+        let reach = self.width / 2.0 + BARRIER + 10.0;
+        let clear = |s: f32| {
+            let (p, left) = (self.point_at(s), self.dir_at(s).perp());
+            [-1.0, -0.5, 0.0, 0.5, 1.0]
+                .iter()
+                .all(|&k| channel.distance(p + left * k * reach) > RIVER_HALF + RIVER_BANK + 15.0)
+        };
+        let end = |s: f32, step: f32| {
+            let mut e = s;
+            while !clear(e) && (e - s).abs() < 1500.0 {
+                e += step;
+            }
+            e + step * 2.0
+        };
+        [(DeckKind::Bridge, bridge), (DeckKind::Ford, ford)]
+            .into_iter()
+            .map(|(kind, s)| (kind, end(s, -5.0), end(s, 5.0)))
+            .collect()
+    }
+
+    /// Ravines and river channels carved into the ground.
+    pub fn cuts(&self) -> Vec<Cut> {
+        let mut cuts = Vec::new();
+        for s in self.jumps() {
+            let (p, across) = (self.point_at(s), self.dir_at(s).perp());
+            let reach = self.width / 2.0 + 260.0;
+            cuts.push(Cut {
+                a: p - across * reach,
+                b: p + across * reach,
+                half_width: RAVINE_GAP / 2.0 - 25.0,
+                bank: 25.0,
+                depth: 170.0,
+            });
+        }
+        if let Some((a, b, ..)) = self.river() {
+            cuts.push(river_cut(a, b));
+        }
+        cuts
+    }
+
+    /// Ramps, the bridge and the ford, given the ground they sit on. Also
+    /// sets the water level when there's a river.
+    pub fn shape(&self, terrain: Terrain) -> Terrain {
+        let mut decks = Vec::new();
+        let mut water = None;
+        // A deck running along the track from `s0` to `s1`.
+        let along = |kind: DeckKind, s0: f32, s1: f32, half_width: f32, h0: f32, h1: f32, sag: f32| {
+            let (a, b) = (self.point_at(s0), self.point_at(s1));
+            let half = Vec2::new(a.distance(b) / 2.0, half_width);
+            Deck { kind, center: (a + b) / 2.0, dir: (b - a).normalize(), half, h0, h1, sag }
+        };
+        for s in self.ramps() {
+            let start = s - RAMP_LENGTH;
+            let (h0, h1) = (terrain.ground(self.point_at(start)), terrain.ground(self.point_at(s)));
+            decks.push(along(DeckKind::Ramp, start, s, self.width / 2.0, h0, h1 + RAMP_HEIGHT, 0.0));
+        }
+        if let Some((a, b, ..)) = self.river() {
+            let half_width = self.width / 2.0 + BARRIER + 10.0;
+            let ground = |s: f32| terrain.ground(self.point_at(s));
+            let crossings = self.crossings();
+            let (_, b0, b1) = crossings[0];
+            let (_, f0, f1) = crossings[1];
+            // Water sits a little below the lower river bank.
+            let level = [b0, b1, f0, f1].map(ground).into_iter().fold(f32::MAX, f32::min) - 22.0;
+            water = Some((level, river_cut(a, b)));
+            // Bridge and ford follow the track's curve in short sections,
+            // with one height profile over the whole crossing.
+            let mut crossing = |kind: DeckKind, s0: f32, s1: f32, sag: f32| {
+                let profile = Deck {
+                    kind,
+                    center: Vec2::ZERO,
+                    dir: Vec2::X,
+                    half: Vec2::ONE,
+                    h0: ground(s0),
+                    h1: ground(s1),
+                    sag,
+                };
+                let n = ((s1 - s0) / (self.step() * 2.0)).ceil() as usize;
+                for i in 0..n {
+                    let (t0, t1) = (i as f32 / n as f32, (i + 1) as f32 / n as f32);
+                    let (a, b) = (s0 + (s1 - s0) * t0, s0 + (s1 - s0) * t1);
+                    let mut d = along(kind, a, b, half_width, profile.height_at(t0), profile.height_at(t1), 0.0);
+                    d.half.x += 10.0; // overlap, so the outside of a bend has no holes
+                    decks.push(d);
+                }
+            };
+            crossing(DeckKind::Bridge, b0, b1, 0.0);
+            // The ford dips just under the water in the middle.
+            let (h0, h1) = (ground(f0), ground(f1));
+            crossing(DeckKind::Ford, f0, f1, (h0 + h1) / 2.0 - (level - 7.0));
+        }
+        let mut terrain = terrain.with_decks(decks);
+        terrain.water = water;
+        terrain
+    }
+
+    /// Barrier boxes along both edges: (centre, rotation, size). There are
+    /// none over a ravine: the gap has to be jumped.
     pub fn barriers(&self) -> Vec<(Vec2, f32, Vec2)> {
+        let jumps = self.jumps();
         let n = self.len();
         let half = self.width / 2.0 + BARRIER / 2.0;
         let mut out = Vec::new();
@@ -183,6 +378,10 @@ impl Track {
                 let (a, b) = (edge(i), edge(i + 2));
                 let len = a.distance(b);
                 if len < 1.0 {
+                    continue;
+                }
+                let s = i as f32 * self.step();
+                if jumps.iter().any(|&j| self.delta(j, s).abs() < RAVINE_GAP / 2.0 + 40.0) {
                     continue;
                 }
                 // A little longer than the gap so the corners overlap.
@@ -230,6 +429,11 @@ pub static DUSTLINE: TrackDef = TrackDef {
     laps: 4,
     asphalt: Color::srgb(0.24, 0.23, 0.23),
     kerbs: [Color::srgb(0.85, 0.15, 0.12), Color::srgb(0.92, 0.92, 0.9)],
+    features: &[
+        Feature::Boost { at: 0.4, lateral: 50.0 },
+        Feature::Ramp { at: 0.6 },
+        Feature::Boost { at: 0.925, lateral: -50.0 },
+    ],
 };
 
 pub static RED_CANYON: TrackDef = TrackDef {
@@ -257,6 +461,12 @@ pub static RED_CANYON: TrackDef = TrackDef {
     laps: 3,
     asphalt: Color::srgb(0.3, 0.26, 0.24),
     kerbs: [Color::srgb(0.9, 0.85, 0.2), Color::srgb(0.12, 0.12, 0.12)],
+    features: &[
+        Feature::Boost { at: 0.05, lateral: 0.0 },
+        Feature::Boost { at: 0.25, lateral: -50.0 },
+        Feature::Boost { at: 0.797, lateral: 0.0 },
+        Feature::Jump { at: 0.825 },
+    ],
 };
 
 pub static PINE_RIDGE: TrackDef = TrackDef {
@@ -279,7 +489,16 @@ pub static PINE_RIDGE: TrackDef = TrackDef {
     laps: 4,
     asphalt: Color::srgb(0.22, 0.23, 0.22),
     kerbs: [Color::srgb(0.85, 0.15, 0.12), Color::srgb(0.92, 0.92, 0.9)],
+    features: &[
+        Feature::River { bridge: 0.6, ford: 0.087 },
+        Feature::Boost { at: 0.64, lateral: 40.0 },
+        Feature::Boost { at: 0.95, lateral: -40.0 },
+    ],
 };
+
+fn river_cut(a: Vec2, b: Vec2) -> Cut {
+    Cut { a, b, half_width: RIVER_HALF, bank: RIVER_BANK, depth: RIVER_DEPTH }
+}
 
 /// Gentle hills everywhere, with the ground rising beyond the track's box.
 pub fn rolling(p: Vec2, size: Vec2, amp: f32, phase: f32) -> f32 {
@@ -348,6 +567,59 @@ mod tests {
             for i in 0..t.len() {
                 let p = t.points[i];
                 assert!(p.x.abs() < room.x && p.y.abs() < room.y, "{}: track leaves the arena at {p}", def.name);
+            }
+        }
+    }
+
+    /// The ground as built for a race: relief, cuts and decks.
+    fn race_terrain(def: &crate::arena::ArenaDef) -> (Track, Terrain) {
+        let t = Track::new(def.track().unwrap());
+        let terrain = t.shape(Terrain::new(def.relief, def.size).with_cuts(t.cuts()));
+        (t, terrain)
+    }
+
+    #[test]
+    fn features_sit_on_the_track() {
+        for def in crate::arena::ARENAS.iter().filter(|a| a.is_race()) {
+            let (t, _) = race_terrain(def);
+            for (p, _) in t.boosts() {
+                assert!(t.distance(p) + BOOST_PAD.y / 2.0 < t.width / 2.0, "{}: boost pad off the track", def.name);
+            }
+            // Jumps need a straight run-up: no tight bend over the ramp.
+            for s in t.ramps() {
+                let bend = (0..8).map(|k| t.curvature_at(s - k as f32 * 20.0)).fold(0.0, f32::max);
+                assert!(bend < 1.0 / 600.0, "{}: ramp on a bend (radius {:.0})", def.name, 1.0 / bend);
+            }
+        }
+    }
+
+    #[test]
+    fn ravines_are_deep_and_ramps_lift() {
+        let def = &crate::arena::ARENAS[4];
+        let (t, terrain) = race_terrain(def);
+        let s = t.jumps()[0];
+        let gap = terrain.height(t.point_at(s));
+        let lip = terrain.height(t.point_at(s - RAVINE_GAP / 2.0 - 1.0));
+        let run_up = terrain.height(t.point_at(s - RAVINE_GAP / 2.0 - RAMP_LENGTH - 5.0));
+        assert!(lip - gap > 120.0, "ravine only {:.0} deep", lip - gap);
+        assert!(lip - run_up > RAMP_HEIGHT * 0.7, "ramp only {:.0} high", lip - run_up);
+    }
+
+    #[test]
+    fn bridge_stays_dry_and_ford_is_wet() {
+        let def = &crate::arena::ARENAS[5];
+        let (t, terrain) = race_terrain(def);
+        let crossings = t.crossings();
+        let mid = |k: usize| t.point_at((crossings[k].1 + crossings[k].2) / 2.0);
+        assert_eq!(terrain.water_depth(mid(0)), 0.0, "bridge is under water");
+        let ford = terrain.water_depth(mid(1));
+        assert!(ford > 2.0 && ford < 15.0, "ford water is {ford:.1} deep");
+        // Away from the river nothing is flooded.
+        for k in 0..t.len() {
+            let p = t.point_at(k as f32 * t.step());
+            let near = crossings.iter().any(|&(_, a, b)| t.delta(a, k as f32 * t.step()) > -20.0 && t.delta(b, k as f32 * t.step()) < 20.0);
+            if !near {
+                assert_eq!(terrain.water_depth(p), 0.0, "track flooded at {p}");
             }
         }
     }

@@ -12,8 +12,8 @@ use bevy::prelude::*;
 
 use crate::RoundEntity;
 use crate::physics::{Contact, Obb};
-use crate::terrain::{Canvas, Terrain, berm, bump, smoothstep};
-use crate::track::{self, BARRIER, Track, TrackDef};
+use crate::terrain::{Canvas, Cut, Deck, DeckKind, Terrain, berm, bump, smoothstep};
+use crate::track::{self, BARRIER, BOOST_PAD, Track, TrackDef};
 
 /// What an arena is used for: a walled derby arena, or a race track.
 #[derive(Clone, Copy)]
@@ -314,14 +314,17 @@ pub struct Layout {
     pub obstacles: Vec<Obstacle>,
     pub decor: Vec<Decor>,
     pub track: Option<Track>,
+    /// Ravines and river channels: nothing gets placed in them.
+    pub cuts: Vec<Cut>,
     rng: u32,
 }
 
 impl Layout {
     pub fn new(def: &ArenaDef) -> Self {
         let track = def.track().map(Track::new);
+        let cuts = track.as_ref().map_or(Vec::new(), Track::cuts);
         let mut layout =
-            Self { size: def.size, obstacles: Vec::new(), decor: Vec::new(), track, rng: def.seed.max(1) };
+            Self { size: def.size, obstacles: Vec::new(), decor: Vec::new(), track, cuts, rng: def.seed.max(1) };
         match &layout.track {
             Some(t) => {
                 let theme = &def.theme;
@@ -394,6 +397,7 @@ impl Layout {
         pos.x.abs() < half.x
             && pos.y.abs() < half.y
             && self.track.as_ref().is_none_or(|t| t.distance(pos) > t.width / 2.0 + BARRIER + r + gap)
+            && self.cuts.iter().all(|c| c.distance(pos) > c.half_width + c.bank + r)
             && self
                 .decor
                 .iter()
@@ -961,17 +965,58 @@ pub fn spawn_arena(
     def: &ArenaDef,
 ) -> (Vec<Obstacle>, Terrain, Option<Track>) {
     let layout = Layout::new(def);
-    let terrain = Terrain::new(def.relief, def.size);
+    let mut terrain = Terrain::new(def.relief, def.size).with_cuts(layout.cuts.clone());
+    if let Some(t) = &layout.track {
+        terrain = t.shape(terrain);
+    }
     let mut canvas = Canvas::new(def.size, def.theme.outfield);
     canvas.rect(Vec2::ZERO, 0.0, def.size, def.theme.floor);
     let fade_trees = !def.is_race();
-    let mut p = Painter { commands, art, materials, terrain, fade_trees };
+    let mut p = Painter { commands, art, materials, terrain: terrain.clone(), fade_trees };
 
     for d in &layout.decor {
         draw_decor(&mut p, &mut canvas, d);
     }
     if let (Some(t), Some(td)) = (&layout.track, def.track()) {
+        if let Some((_, river)) = terrain.water {
+            let (mid, along) = ((river.a + river.b) / 2.0, river.b - river.a);
+            let wide = 2.0 * (river.half_width + river.bank);
+            canvas.rect(mid, along.to_angle(), Vec2::new(along.length(), wide), Color::srgb(0.3, 0.27, 0.2));
+        }
         paint_track(&mut canvas, t, td);
+        for cut in layout.cuts.iter().filter(|c| c.depth > 150.0) {
+            // Ravine: dark rock all the way down.
+            let along = cut.b - cut.a;
+            let wide = 2.0 * (cut.half_width + cut.bank) + 10.0;
+            canvas.rect((cut.a + cut.b) / 2.0, along.to_angle(), Vec2::new(along.length(), wide), Color::srgb(0.22, 0.16, 0.13));
+        }
+        for (pos, dir) in t.boosts() {
+            draw_boost(&mut p, &mut canvas, pos, dir);
+        }
+        for deck in terrain.decks().iter().filter(|d| d.kind == DeckKind::Ramp) {
+            draw_ramp(&mut p, deck);
+        }
+        for (kind, s0, s1) in t.crossings() {
+            draw_crossing(&mut p, meshes, images, t, td, kind, s0, s1);
+        }
+        if let Some((level, river)) = terrain.water {
+            let water = p.materials.add(StandardMaterial {
+                base_color: Color::srgb(0.16, 0.38, 0.5),
+                alpha_mode: AlphaMode::Blend,
+                // Drawn after the ford's fading gravel, so the gravel shows through.
+                depth_bias: 20.0,
+                perceptual_roughness: 0.12,
+                reflectance: 0.6,
+                ..default()
+            });
+            p.commands.spawn((
+                RoundEntity,
+                Mesh3d(meshes.add(water_mesh(&terrain, level, &river, def.size))),
+                MeshMaterial3d(water),
+                Transform::from_translation(((river.a + river.b) / 2.0).extend(level)),
+                bevy::light::NotShadowCaster,
+            ));
+        }
         draw_gantry(&mut p, t);
     }
     for o in &layout.obstacles {
@@ -988,6 +1033,47 @@ pub fn spawn_arena(
     let (mesh, material) = crate::terrain::build_ground(&terrain, canvas, meshes, images, p.materials);
     p.commands.spawn((RoundEntity, mesh, material, Transform::default()));
     (layout.obstacles, terrain, layout.track)
+}
+
+/// The river's surface: a grid over the channel whose transparency follows
+/// the depth, so the shallows (and the ford) show the bottom through it.
+fn water_mesh(terrain: &Terrain, level: f32, river: &Cut, size: Vec2) -> Mesh {
+    use bevy::asset::RenderAssetUsages;
+    use bevy::mesh::{Indices, PrimitiveTopology};
+    let dir = (river.b - river.a).normalize();
+    let left = dir.perp();
+    // Only the stretch that's on the map.
+    let reach = size / 2.0 + Vec2::splat(crate::terrain::MARGIN);
+    let inside = |p: Vec2| p.x.abs() < reach.x && p.y.abs() < reach.y;
+    let total = river.a.distance(river.b);
+    let along: Vec<f32> = (0..=(total / 20.0) as usize).map(|i| i as f32 * 20.0).filter(|&d| inside(river.a + dir * d)).collect();
+    let half = river.half_width + river.bank;
+    let across = 16;
+    let origin = (river.a + river.b) / 2.0;
+    let (mut pos, mut colors, mut idx) = (Vec::new(), Vec::new(), Vec::new());
+    for &d in &along {
+        for j in 0..=across {
+            let p = river.a + dir * d + left * (j as f32 / across as f32 * 2.0 - 1.0) * half;
+            let depth = level - terrain.height(p);
+            // Clear in the shallows, deep blue in the channel.
+            let alpha = if depth <= 0.0 { 0.0 } else { (0.25 + depth / 50.0).min(0.88) };
+            pos.push([p.x - origin.x, p.y - origin.y, 0.0]);
+            colors.push([1.0, 1.0, 1.0, alpha]);
+        }
+    }
+    let row = across as u32 + 1;
+    for i in 0..along.len().saturating_sub(1) as u32 {
+        for j in 0..across as u32 {
+            let a = i * row + j;
+            idx.extend([a, a + row, a + row + 1, a, a + row + 1, a + 1]);
+        }
+    }
+    let n = pos.len();
+    Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::RENDER_WORLD)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, pos)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0.0, 0.0, 1.0]; n])
+        .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
+        .with_inserted_indices(Indices::U32(idx))
 }
 
 /// Asphalt, kerbs, the chequered start line and the grid boxes.
@@ -1024,6 +1110,299 @@ fn paint_track(canvas: &mut Canvas, t: &Track, def: &TrackDef) {
         for side in [-1.0, 1.0] {
             canvas.rect(at + dir * 14.0 + dir.perp() * side * 24.0, heading, Vec2::new(36.0, 4.0), white);
         }
+    }
+}
+
+/// A boost pad: a dark plate with glowing chevrons pointing the way.
+fn draw_boost(p: &mut Painter, canvas: &mut Canvas, pos: Vec2, dir: Vec2) {
+    canvas.rect(pos, dir.to_angle(), BOOST_PAD + Vec2::splat(8.0), Color::srgb(0.95, 0.75, 0.1));
+    canvas.rect(pos, dir.to_angle(), BOOST_PAD, Color::srgb(0.1, 0.12, 0.16));
+    let root = p.root_at(pos.extend(p.terrain.height(pos)), Quat::from_rotation_z(dir.to_angle()));
+    let glow = p.material(Color::srgb(0.25, 0.85, 1.0), true);
+    // Three ">" chevrons, centred on the pad: each arm is 24 long at 45°,
+    // so it reaches 8.5 back and 8.5 out from the chevron's tip.
+    for k in 0..3 {
+        let tip = -9.0 + 18.0 * k as f32;
+        for side in [-1.0, 1.0] {
+            let at = Vec3::new(tip - 8.5, side * 8.5, 1.2);
+            let rot = Quat::from_rotation_z(-side * std::f32::consts::FRAC_PI_4);
+            p.add(root, M::Cube, glow.clone(), at, rot, Vec3::new(24.0, 6.0, 1.5));
+        }
+    }
+}
+
+/// A ramp: a sloping slab on a solid base, with hazard stripes on the lip.
+fn draw_ramp(p: &mut Painter, deck: &Deck) {
+    let root = p.root_at(deck.center.extend(0.0), Quat::from_rotation_z(deck.dir.to_angle()));
+    let (top, side) = (Color::srgb(0.55, 0.42, 0.28), Color::srgb(0.4, 0.33, 0.25));
+    let top = p.material(top, false);
+    let n = ((deck.half.x * 2.0 / 20.0).ceil() as usize).max(1);
+    let seg = deck.half.x * 2.0 / n as f32;
+    let thick = 4.0;
+    for i in 0..n {
+        let (z0, z1) = (deck.height_at(i as f32 / n as f32), deck.height_at((i + 1) as f32 / n as f32));
+        let x = -deck.half.x + (i as f32 + 0.5) * seg;
+        let pitch = ((z1 - z0) / seg).atan();
+        let mid = (z0 + z1) / 2.0;
+        let size = Vec3::new(seg / pitch.cos() + 2.0, deck.half.y * 2.0, thick);
+        p.add(root, M::Cube, top.clone(), Vec3::new(x, 0.0, mid - thick / 2.0), Quat::from_rotation_y(-pitch), size);
+        let ground = p.terrain.ground(deck.center + deck.dir * x) - 10.0;
+        if mid - thick > ground {
+            p.block(root, side, Vec2::new(x, 0.0), ground, Vec3::new(seg + 0.5, deck.half.y * 2.0, mid - thick - ground));
+        }
+    }
+    let lip = deck.height_at(1.0);
+    let n = (deck.half.y * 2.0 / 20.0) as i32;
+    for k in 0..n {
+        let color = if k % 2 == 0 { Color::srgb(0.95, 0.8, 0.1) } else { Color::srgb(0.1, 0.1, 0.1) };
+        let y = -deck.half.y + (k as f32 + 0.5) * deck.half.y * 2.0 / n as f32;
+        p.block(root, color, Vec2::new(deck.half.x - 5.0, y), lip - 0.5, Vec3::new(10.0, deck.half.y * 2.0 / n as f32, 1.2));
+    }
+}
+
+/// One cross-section of a ribbon: centre, the "left" direction, how far it
+/// reaches each way, and its top and bottom heights.
+struct Section {
+    center: Vec2,
+    left: Vec2,
+    half: f32,
+    top: f32,
+    bottom: f32,
+}
+
+/// A continuous strip along a path: two side walls, and a top surface if
+/// `top` is set.
+fn ribbon(sections: &[Section], top: bool) -> Mesh {
+    use bevy::asset::RenderAssetUsages;
+    use bevy::mesh::{Indices, PrimitiveTopology};
+    let (mut pos, mut normals, mut idx): (Vec<[f32; 3]>, Vec<[f32; 3]>, Vec<u32>) = (vec![], vec![], vec![]);
+    let mut strip = |a: &dyn Fn(&Section) -> Vec3, b: &dyn Fn(&Section) -> Vec3, normal: &dyn Fn(&Section) -> Vec3| {
+        let base = pos.len() as u32;
+        for s in sections {
+            pos.push(a(s).to_array());
+            pos.push(b(s).to_array());
+            normals.push(normal(s).to_array());
+            normals.push(normal(s).to_array());
+        }
+        for i in 0..sections.len() as u32 - 1 {
+            let (a0, b0, a1, b1) = (base + 2 * i, base + 2 * i + 1, base + 2 * i + 2, base + 2 * i + 3);
+            idx.extend([a0, a1, b1, a0, b1, b0]);
+        }
+    };
+    let edge = |s: &Section, side: f32, z: f32| (s.center + s.left * side * s.half).extend(z);
+    if top {
+        strip(&|s| edge(s, -1.0, s.top), &|s| edge(s, 1.0, s.top), &|_| Vec3::Z);
+    }
+    for side in [-1.0, 1.0] {
+        strip(&move |s| edge(s, side, s.top), &move |s| edge(s, side, s.bottom), &move |s| (s.left * side).extend(0.0));
+    }
+    // Textures are laid flat over the world, one tile every 128 units.
+    let uvs: Vec<[f32; 2]> = pos.iter().map(|p| [p[0] / 128.0, p[1] / 128.0]).collect();
+    Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::RENDER_WORLD)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, pos)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+        .with_inserted_indices(Indices::U32(idx))
+}
+
+/// The top of a ribbon as a fine grid whose opacity is `alpha` at each
+/// point, with vertices relative to `origin`.
+fn faded_top(sections: &[Section], origin: Vec3, alpha: &dyn Fn(Vec2) -> f32) -> Mesh {
+    use bevy::asset::RenderAssetUsages;
+    use bevy::mesh::{Indices, PrimitiveTopology};
+    const ACROSS: usize = 24;
+    let (mut pos, mut uvs, mut colors, mut idx) = (vec![], vec![], vec![], vec![]);
+    for s in sections {
+        for j in 0..=ACROSS {
+            let c = s.center + s.left * (j as f32 / ACROSS as f32 * 2.0 - 1.0) * s.half;
+            pos.push((c.extend(s.top) - origin).to_array());
+            uvs.push([c.x / 128.0, c.y / 128.0]);
+            colors.push([1.0, 1.0, 1.0, alpha(c).clamp(0.0, 1.0)]);
+        }
+    }
+    let row = ACROSS as u32 + 1;
+    for i in 0..sections.len() as u32 - 1 {
+        for j in 0..ACROSS as u32 {
+            let a = i * row + j;
+            idx.extend([a, a + row, a + row + 1, a, a + row + 1, a + 1]);
+        }
+    }
+    let n = pos.len();
+    Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::RENDER_WORLD)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, pos)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0.0, 0.0, 1.0]; n])
+        .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
+        .with_inserted_indices(Indices::U32(idx))
+}
+
+/// A tiling gravel texture: pebbles of mixed stone colours, each with a light
+/// top-left and a shadow to the bottom right, packed on darker grit.
+fn gravel_texture() -> Image {
+    use bevy::asset::RenderAssetUsages;
+    use bevy::image::{ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
+    use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+    const N: usize = 256;
+    let mut rng = 0x06A1_17E1_u32;
+    let mut rand = || {
+        rng ^= rng << 13;
+        rng ^= rng >> 17;
+        rng ^= rng << 5;
+        rng as f32 / u32::MAX as f32
+    };
+    // Grit: dark, slightly speckled.
+    let mut px: Vec<Vec3> = (0..N * N).map(|_| Vec3::splat(0.26 + rand() * 0.08) * Vec3::new(1.0, 0.96, 0.88)).collect();
+    let stones = [
+        Vec3::new(0.62, 0.58, 0.5),
+        Vec3::new(0.5, 0.47, 0.42),
+        Vec3::new(0.7, 0.66, 0.58),
+        Vec3::new(0.55, 0.45, 0.36),
+        Vec3::new(0.44, 0.44, 0.45),
+    ];
+    for _ in 0..1040 {
+        let (cx, cy) = (rand() * N as f32, rand() * N as f32);
+        let (rx, ry) = (2.0 + rand() * 4.5, 1.8 + rand() * 3.5);
+        let angle = rand() * std::f32::consts::TAU;
+        let color = stones[(rand() * stones.len() as f32) as usize % stones.len()] * (0.9 + rand() * 0.2);
+        let (sin, cos) = angle.sin_cos();
+        let r = rx.max(ry).ceil() as i32 + 2;
+        for dy in -r..=r {
+            for dx in -r..=r {
+                let (x, y) = (dx as f32, dy as f32);
+                let (u, v) = ((x * cos + y * sin) / rx, (-x * sin + y * cos) / ry);
+                let d = u * u + v * v;
+                // Wraps round the edges so the texture tiles.
+                let i = ((cy as i32 + dy).rem_euclid(N as i32) as usize) * N + (cx as i32 + dx).rem_euclid(N as i32) as usize;
+                if d <= 1.0 {
+                    // Lit from the top left.
+                    let light = 1.0 + 0.25 * (-(x / rx + y / ry) * 0.5).clamp(-1.0, 1.0) - 0.15 * d;
+                    px[i] = color * light;
+                } else if d <= 1.6 && dx + dy > 0 {
+                    px[i] *= 0.75; // shadow
+                }
+            }
+        }
+    }
+    let data = px
+        .iter()
+        .flat_map(|c| {
+            let [r, g, b] = c.to_array().map(|v| (v.clamp(0.0, 1.0) * 255.0) as u8);
+            [r, g, b, 255]
+        })
+        .collect();
+    let mut image = Image::new(
+        Extent3d { width: N as u32, height: N as u32, depth_or_array_layers: 1 },
+        TextureDimension::D2,
+        data,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+        address_mode_u: ImageAddressMode::Repeat,
+        address_mode_v: ImageAddressMode::Repeat,
+        ..ImageSamplerDescriptor::linear()
+    });
+    image
+}
+
+/// A bridge or ford: one continuous surface following the track, with kerbs.
+/// A bridge stands on its banks and on pillars in the river; a ford is a
+/// solid causeway.
+#[allow(clippy::too_many_arguments)]
+fn draw_crossing(
+    p: &mut Painter,
+    meshes: &mut Assets<Mesh>,
+    images: &mut Assets<Image>,
+    t: &Track,
+    def: &TrackDef,
+    kind: DeckKind,
+    s0: f32,
+    s1: f32,
+) {
+    let n = ((s1 - s0) / 10.0).ceil() as usize;
+    let at = |i: usize| s0 + (s1 - s0) * i as f32 / n as f32;
+    let road = t.width / 2.0;
+    let (body, body_half, thick) = match kind {
+        DeckKind::Bridge => (Color::srgb(0.58, 0.57, 0.54), road + BARRIER + 17.0, 16.0),
+        _ => (Color::srgb(0.48, 0.45, 0.38), road + BARRIER + 10.0, 6.0),
+    };
+    let terrain = p.terrain.clone();
+    let sections = |half: f32, lift: f32, depth: &dyn Fn(Vec2, f32) -> f32| -> Vec<Section> {
+        (0..=n)
+            .map(|i| {
+                let s = at(i);
+                let center = t.point_at(s);
+                let top = terrain.height(center) + lift;
+                Section { center, left: t.dir_at(s).perp(), half, top, bottom: depth(center, top) }
+            })
+            .collect()
+    };
+    // A ford is loose gravel; everything else is plain.
+    let gravel = (kind == DeckKind::Ford).then(|| images.add(gravel_texture()));
+    let solid = |material: Color| StandardMaterial {
+        base_color: if gravel.is_some() { Color::WHITE } else { material },
+        base_color_texture: gravel.clone(),
+        perceptual_roughness: 0.9,
+        double_sided: true,
+        cull_mode: None,
+        ..default()
+    };
+    let mut spawn = |p: &mut Painter, mesh: Mesh, color: Color| {
+        let material = p.materials.add(solid(color));
+        p.commands.spawn((RoundEntity, Mesh3d(meshes.add(mesh)), MeshMaterial3d(material), Transform::default()));
+    };
+    // The body: a girder over the water, solid where the bank comes up close.
+    let body_sections = sections(body_half, -0.6, &|c, top| {
+        let ground = terrain.ground(c) - 10.0;
+        if kind == DeckKind::Ford || ground > top - 45.0 { ground.min(top - thick) } else { top - thick }
+    });
+    spawn(p, ribbon(&body_sections, kind != DeckKind::Ford), body);
+    if kind == DeckKind::Bridge {
+        spawn(p, ribbon(&sections(road, 0.0, &|_, top| top - 1.0), true), def.asphalt);
+        // Kerbs: short blocks in alternating colours along both edges.
+        for i in 0..n {
+            let s = (at(i) + at(i + 1)) / 2.0;
+            let (c, dir) = (t.point_at(s), t.dir_at(s));
+            let color = def.kerbs[(i / 6) % 2];
+            for side in [-1.0, 1.0] {
+                let e = c + dir.perp() * side * (road - 7.0);
+                let root = p.root_at(e.extend(p.terrain.height(e)), Quat::from_rotation_z(dir.to_angle()));
+                p.block(root, color, Vec2::ZERO, -0.5, Vec3::new((s1 - s0) / n as f32 + 1.0, 14.0, 0.9));
+            }
+        }
+        // Pillars where the river runs underneath.
+        for i in (0..=n).step_by(9) {
+            let c = t.point_at(at(i));
+            let top = p.terrain.height(c) - thick;
+            let ground = p.terrain.ground(c) - 10.0;
+            if top - ground > 45.0 {
+                let root = p.root_at(c.extend(0.0), Quat::from_rotation_z(t.dir_at(at(i)).to_angle()));
+                for y in [-0.6, 0.6] {
+                    p.post(root, body, Vec2::new(0.0, y * body_half), ground, 10.0, top - ground);
+                }
+            }
+        }
+    }
+    if kind == DeckKind::Ford
+        && let Some((level, river)) = terrain.water
+    {
+        // The gravel fades out with distance from the river, so the ford
+        // blends into the road along lines that follow the banks.
+        let fade = |c: Vec2| 1.0 - smoothstep(river.half_width + 30.0, river.half_width + river.bank + 10.0, river.distance(c));
+        let origin = body_sections[n / 2].center.extend(level);
+        let material = p.materials.add(StandardMaterial {
+            base_color_texture: gravel.clone(),
+            alpha_mode: AlphaMode::Blend,
+            perceptual_roughness: 0.9,
+            ..default()
+        });
+        p.commands.spawn((
+            RoundEntity,
+            Mesh3d(meshes.add(faded_top(&body_sections, origin, &fade))),
+            MeshMaterial3d(material),
+            Transform::from_translation(origin),
+            bevy::light::NotShadowCaster,
+        ));
     }
 }
 

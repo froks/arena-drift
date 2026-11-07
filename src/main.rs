@@ -47,6 +47,15 @@ const HANDBRAKE_GRIP: f32 = 1.2;
 const WRECK_DRAG: f32 = 2.5;
 const WRECK_MASS: f32 = 2.5; // wrecks are heavier, so they act like obstacles
 const TURBO_MULTIPLIER: f32 = 1.9;
+/// Pulls cars back down after a jump (px/s²).
+const FALL_GRAVITY: f32 = 1100.0;
+/// A car this far above the ground counts as airborne.
+const AIRBORNE: f32 = 4.0;
+/// Speed lost per second while driving through water.
+const WATER_DRAG: f32 = 1.4;
+/// Turbo from driving over a boost pad.
+const BOOST_SECONDS: f32 = 1.2;
+const BOOST_KICK: f32 = 160.0;
 
 const RESTITUTION: f32 = 0.6;
 /// Scales rotational inertia; higher = cars spin less from off-centre hits.
@@ -126,6 +135,10 @@ struct Car {
     paint: Paint,
     /// Set once the wreck has been handled (sound, paint).
     wrecked: bool,
+    /// Vertical speed, for jumps.
+    vz: f32,
+    /// In the air: no grip, no steering, no engine.
+    airborne: bool,
 }
 
 impl Car {
@@ -141,6 +154,8 @@ impl Car {
             handbrake: false,
             paint,
             wrecked: false,
+            vz: 0.0,
+            airborne: false,
         }
     }
     fn alive(&self) -> bool {
@@ -471,6 +486,8 @@ struct Art {
     arrow_mesh: Handle<Mesh>,
     bar_back_mat: Handle<StandardMaterial>,
     white_mat: Handle<StandardMaterial>,
+    spray_mat: Handle<StandardMaterial>,
+    ripple_mat: Handle<StandardMaterial>,
 }
 
 /// Tiny xorshift RNG so we don't need an extra crate.
@@ -572,6 +589,7 @@ fn main() {
                     car_collisions,
                     track_progress.run_if(resource_exists::<Track>),
                     follow_terrain,
+                    race_hazards.run_if(resource_exists::<Track>),
                     skid_marks,
                 )
                     .chain(),
@@ -603,6 +621,7 @@ fn main() {
                 icons::pulse_pickup_glow,
                 cars::steer_front_wheels,
                 arena::fade_canopies,
+                river_ripples.run_if(resource_exists::<Track>),
                 (attach_health_bars, update_health_bars).chain().after(follow_terrain),
                 camera_follow.after(follow_terrain),
             ),
@@ -634,6 +653,13 @@ fn dev_screenshot(mut commands: Commands, time: Res<Time<Real>>, mut done: Local
         *done = true;
         commands.spawn(Screenshot::primary_window()).observe(save_to_disk(path));
     }
+}
+
+/// `ARENA_DRIFT_LOOK=x,y,zoom`: where a player-less camera looks (dev aid).
+fn dev_look() -> Option<(Vec2, f32)> {
+    let v = std::env::var("ARENA_DRIFT_LOOK").ok()?;
+    let n: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+    (n.len() == 3).then(|| (Vec2::new(n[0], n[1]), n[2]))
 }
 
 /// Vertical field of view. Wider means more parallax on tall things.
@@ -698,6 +724,9 @@ fn setup_world(
         arrow_mesh: meshes.add(Triangle2d::new(Vec2::new(0.0, -5.0), Vec2::new(6.0, 4.0), Vec2::new(-6.0, 4.0))),
         bar_back_mat: materials.add(glow(Color::srgb(0.12, 0.03, 0.03))),
         white_mat: materials.add(glow(Color::WHITE)),
+        spray_mat: materials.add(glow(Color::srgba(0.85, 0.93, 1.0, 0.75))),
+        // Drawn after the water and the ford's gravel.
+        ripple_mat: materials.add(StandardMaterial { depth_bias: 40.0, ..glow(Color::srgba(0.85, 0.95, 1.0, 0.3)) }),
     });
 }
 
@@ -1514,6 +1543,16 @@ fn ai_race(
         ais.iter().map(|(e, t, c, _, _, r)| (e, t.translation.truncate(), r.progress, r.lateral, c.alive())),
     );
     let pickups: Vec<(Vec2, PickupKind)> = pickups.iter().map(|(t, p)| (t.translation.truncate(), p.0)).collect();
+    // Boost pads (distance along the track, offset across) and ramp lips.
+    let pads: Vec<(f32, f32)> = track
+        .boosts()
+        .iter()
+        .map(|&(p, _)| {
+            let spot = track.locate(p, None);
+            (spot.s, spot.lateral)
+        })
+        .collect();
+    let ramps = track.ramps();
     // The player, while still racing (`others` only holds non-AI cars).
     let player = others.iter().find(|(_, _, c, r)| c.alive() && r.finish.is_none()).map(|(.., r)| r.progress);
 
@@ -1558,6 +1597,19 @@ fn ai_race(
                 }
             }
         }
+        // ...run over boost pads...
+        let here = s.rem_euclid(track.length);
+        for &(ps, pl) in &pads {
+            let d = track.delta(here, ps);
+            if d > 40.0 && d < 450.0 {
+                lane = pl;
+            }
+        }
+        // ...line up straight and flat out for a jump...
+        let jumping = ramps.iter().any(|&r| (-20.0..650.0).contains(&track.delta(here, r)));
+        if jumping {
+            lane = 0.0;
+        }
         // ...and go round a slower car (or a wreck) in the way. Progress
         // wraps per lap, so compare positions on the track, not laps.
         for &(e, _, other_s, other_lat, _) in &field {
@@ -1585,6 +1637,7 @@ fn ai_race(
         // Rubber band: ease off when well ahead of the player, push a little
         // harder when well behind, so races stay close.
         let pace = match player {
+            _ if jumping => 1.0,
             Some(p) if s > p => ai.pace - 0.15 * ((s - p) / 1200.0).min(1.0),
             Some(p) => (ai.pace + 0.1 * ((p - s) / 1200.0).min(1.0)).min(1.0),
             None => ai.pace,
@@ -1676,6 +1729,152 @@ fn track_progress(
     }
 }
 
+/// Boost pads, falling into a ravine or river, landing off the track, and
+/// spray when driving through water.
+#[allow(clippy::too_many_arguments)]
+fn race_hazards(
+    mut commands: Commands,
+    art: Res<Art>,
+    mut rng: ResMut<Rng>,
+    track: Res<Track>,
+    terrain: Res<Terrain>,
+    mut sounds: ResMut<Sounds>,
+    mut cars: Query<(&mut Transform, &mut Car, &mut Armory, &mut Racer, Has<Player>)>,
+) {
+    let boosts = track.boosts();
+    let jumps = track.jumps();
+    let half = track::BOOST_PAD / 2.0;
+    for (mut tf, mut car, mut armory, mut racer, is_player) in &mut cars {
+        if !car.alive() || car.airborne {
+            continue;
+        }
+        let pos = tf.translation.truncate();
+        let vol = if is_player { 1.0 } else { 0.35 };
+
+        for &(at, dir) in &boosts {
+            let d = pos - at;
+            if d.dot(dir).abs() < half.x && d.dot(dir.perp()).abs() < half.y {
+                // A kick on the way in, then turbo for a moment.
+                if armory.turbo < BOOST_SECONDS - 0.3 {
+                    sounds.play(Sfx::Turbo, vol);
+                    let fwd = car.forward();
+                    let top = car.model.top_speed * 1.4;
+                    car.vel = (car.vel + fwd * BOOST_KICK).clamp_length_max(top);
+                }
+                armory.turbo = armory.turbo.max(BOOST_SECONDS);
+            }
+        }
+
+        if terrain.water_depth(pos) > 0.0 && car.vel.length() > 60.0 && rng.next_f32() < 0.8 {
+            let back = pos - car.forward() * car.model.size.x * 0.4;
+            let side = car.forward().perp() * rng.range(-1.0, 1.0) * car.model.size.y * 0.6;
+            let vel = -car.vel * 0.3 + car.forward().perp() * rng.range(-120.0, 120.0);
+            commands.spawn((
+                RoundEntity,
+                Spark { vel, life: rng.range(0.2, 0.45) },
+                Mesh3d(art.spark_mesh.clone()),
+                MeshMaterial3d(art.spray_mat.clone()),
+                Transform::from_translation((back + side).extend(tf.translation.z + 4.0)),
+            ));
+        }
+
+        // Down in a ravine or the river, or landed beside the track: put the
+        // car back on the track, a run-up before any jump it missed.
+        let fell = terrain.cut_depth(pos) > 40.0 && !terrain.on_deck(pos);
+        let off = racer.lateral.abs() > track.width / 2.0 + track::BARRIER + 40.0;
+        if !(fell || off) {
+            continue;
+        }
+        let here = racer.progress.rem_euclid(track.length);
+        let back = jumps
+            .iter()
+            .map(|&j| track.delta(here, j))
+            .find(|d| (-400.0..300.0).contains(d))
+            .map_or(40.0, |d| d + 450.0);
+        let s = racer.progress - back;
+        let at = track.point_at(s);
+        tf.translation = at.extend(terrain.height(at));
+        car.heading = track.dir_at(s).to_angle();
+        car.vel = Vec2::ZERO;
+        car.spin = 0.0;
+        car.vz = 0.0;
+        racer.progress = s;
+        racer.index = track.locate(at, None).index;
+        racer.lateral = 0.0;
+        sounds.play(Sfx::Crash, vol * 0.6);
+    }
+}
+
+/// A streak of foam drifting down the river.
+#[derive(Component)]
+struct Ripple {
+    vel: Vec2,
+    life: f32,
+    max_life: f32,
+    length: f32,
+}
+
+/// Foam streaks drift downstream; more of them, and faster, where the river
+/// runs shallow (over the ford).
+fn river_ripples(
+    mut commands: Commands,
+    time: Res<Time>,
+    art: Res<Art>,
+    terrain: Res<Terrain>,
+    current: Res<CurrentArena>,
+    mut rng: ResMut<Rng>,
+    mut ripples: Query<(Entity, &mut Transform, &mut Ripple)>,
+) {
+    let dt = time.delta_secs();
+    for (e, mut tf, mut r) in &mut ripples {
+        r.life -= dt;
+        if r.life <= 0.0 {
+            commands.entity(e).despawn();
+            continue;
+        }
+        tf.translation += (r.vel * dt).extend(0.0);
+        // Grow in, then shrink away.
+        let k = r.life / r.max_life;
+        let fade = (k * (1.0 - k) * 4.0).min(1.0);
+        tf.scale = Vec3::new(r.length * fade.max(0.05), 2.2 * fade.max(0.05), 1.0);
+    }
+
+    let Some((level, river)) = terrain.water else { return };
+    let dir = (river.b - river.a).normalize();
+    let half = current.def().size / 2.0 + Vec2::splat(300.0);
+    // Try a handful of random spots on the visible river each frame.
+    for _ in 0..((1200.0 * dt).ceil() as usize) {
+        let along = rng.range(0.0, river.a.distance(river.b));
+        let side = rng.range(-1.0, 1.0) * (river.half_width + river.bank);
+        let p = river.a + dir * along + dir.perp() * side;
+        if p.x.abs() > half.x || p.y.abs() > half.y {
+            continue;
+        }
+        let depth = terrain.water_depth(p);
+        if depth <= 1.0 {
+            continue;
+        }
+        // Shallow water is fast and broken; deep water is calm.
+        let shallow = depth < 15.0;
+        if !shallow && rng.next_f32() > 0.5 {
+            continue;
+        }
+        let speed = if shallow { rng.range(70.0, 110.0) } else { rng.range(25.0, 45.0) };
+        let life = rng.range(1.2, 2.4);
+        let length = if shallow { rng.range(10.0, 22.0) } else { rng.range(18.0, 34.0) };
+        commands.spawn((
+            RoundEntity,
+            Ripple { vel: dir * speed, life, max_life: life, length },
+            Mesh3d(art.square.clone()),
+            MeshMaterial3d(art.ripple_mat.clone()),
+            Transform::from_translation(p.extend(level + 0.4))
+                .with_rotation(Quat::from_rotation_z(dir.to_angle()))
+                .with_scale(Vec3::splat(0.01)),
+            bevy::light::NotShadowCaster,
+        ));
+    }
+}
+
 /// Finishing order so far: finished cars by time, then running cars by
 /// distance, then wrecks.
 fn race_order<'a>(racers: impl Iterator<Item = (Entity, &'a Car, &'a Racer)>) -> Vec<Entity> {
@@ -1724,9 +1923,21 @@ fn car_physics(
     }
     for (mut tf, mut car, mut armory) in &mut q {
         let m = car.model;
+        if car.airborne {
+            // Flying: keep going the way it was going.
+            armory.turbo = (armory.turbo - dt).max(0.0);
+            car.heading += car.spin * dt;
+            tf.translation += (car.vel * dt).extend(0.0);
+            continue;
+        }
+        let pos = tf.translation.truncate();
         // Slopes pull everything downhill: valleys collect wrecks.
-        let downhill = -terrain.gradient(tf.translation.truncate()) * terrain::GRAVITY;
+        let downhill = -terrain.gradient(pos) * terrain::GRAVITY;
         car.vel += downhill * dt;
+        // Water slows everything down.
+        if terrain.water_depth(pos) > 0.0 {
+            car.vel *= (-WATER_DRAG * dt).exp();
+        }
         let fwd = car.forward();
         let right = fwd.perp();
         let mut v_fwd = car.vel.dot(fwd);
@@ -1768,12 +1979,33 @@ fn car_physics(
     }
 }
 
-/// Sit every car on the ground under it, pitched and rolled with the slope.
-fn follow_terrain(terrain: Res<Terrain>, mut q: Query<(&mut Transform, &Car)>) {
-    for (mut tf, car) in &mut q {
+/// Keep every car on the ground under it, pitched and rolled with the slope;
+/// when the ground falls away faster than gravity (a ramp's lip, a ravine),
+/// it flies.
+fn follow_terrain(time: Res<Time>, terrain: Res<Terrain>, mut q: Query<(&mut Transform, &mut Car)>) {
+    let dt = time.delta_secs().max(1e-4);
+    for (mut tf, mut car) in &mut q {
         let pos = tf.translation.truncate();
-        tf.translation.z = terrain.height(pos);
-        tf.rotation = terrain.resting(pos, car.model.size / 2.0, car.heading);
+        let ground = terrain.height(pos);
+        let before = tf.translation.z;
+        car.vz -= FALL_GRAVITY * dt;
+        let mut z = before + car.vz * dt;
+        if z <= ground {
+            // On the ground: ride along with it. A big step up (a wall, the
+            // far side of a ravine) just puts the car on top.
+            let climb = if ground - before > 30.0 { 0.0 } else { (ground - before) / dt };
+            z = ground;
+            car.vz = climb.min(600.0);
+        }
+        car.airborne = z > ground + AIRBORNE;
+        tf.translation.z = z;
+        tf.rotation = if car.airborne {
+            // Nose follows the flight path, a little.
+            let pitch = (car.vz / car.vel.length().max(100.0)).atan() * 0.6;
+            Quat::from_rotation_z(car.heading) * Quat::from_rotation_y(-pitch)
+        } else {
+            terrain.resting(pos, car.model.size / 2.0, car.heading)
+        };
     }
 }
 
@@ -1865,7 +2097,7 @@ fn skid_marks(
         let speed = car.vel.length();
         let fwd = car.forward();
         let slide = car.vel.dot(fwd.perp()).abs();
-        if !car.alive() || !(slide > 110.0 || (car.handbrake && speed > 80.0)) {
+        if !car.alive() || car.airborne || !(slide > 110.0 || (car.handbrake && speed > 80.0)) {
             continue;
         }
         let m = car.model;
@@ -1910,6 +2142,10 @@ fn car_collisions(
     let mut combos = q.iter_combinations_mut();
     while let Some([(mut ta, mut a, a_player), (mut tb, mut b, b_player)]) = combos.fetch_next() {
         let (pa, pb) = (ta.translation.truncate(), tb.translation.truncate());
+        // One flying over the other.
+        if (ta.translation.z - tb.translation.z).abs() > 25.0 {
+            continue;
+        }
         let Some(contact) = a.obb(pa).collide(&b.obb(pb)) else { continue };
         let n = contact.normal;
 
@@ -2292,7 +2528,8 @@ fn spawn_pickups(
             None => Vec2::new(rng.range(-margin.x, margin.x), rng.range(-margin.y, margin.y)),
         };
         let clear_of_cars = cars.iter().all(|t| t.translation.truncate().distance(pos) > 90.0);
-        if clear_of_cars && obstacles.iter().all(|o| o.distance(pos) > 40.0) {
+        let solid = terrain.cut_depth(pos) < 10.0 || terrain.on_deck(pos);
+        if clear_of_cars && solid && obstacles.iter().all(|o| o.distance(pos) > 40.0) {
             break;
         }
     }
@@ -2639,6 +2876,8 @@ fn camera_follow(
                 let pos = ptf.translation.truncate();
                 (pos + car.vel * 0.3, 1.0 + (speed / 800.0).min(1.0) * 0.2, ptf.translation.z, false)
             }
+            // Dev aid: ARENA_DRIFT_LOOK=x,y,zoom shows that spot instead.
+            Err(_) if let Some((at, z)) = dev_look() => (at, z, terrain.height(at), true),
             Err(_) => {
                 let fit = ((arena + Vec2::splat(200.0)) / view).max_element();
                 (Vec2::new(0.0, 30.0 * fit), fit, terrain.height(Vec2::ZERO), false)
