@@ -276,7 +276,8 @@ impl Racer {
     }
 }
 
-/// Race clock and start countdown. Only exists during races.
+/// Round clock and the "3, 2, 1, go" countdown. Exists during every round,
+/// derby or race (whether it's a race is whether there's a [`Track`]).
 #[derive(Resource)]
 struct Race {
     countdown: f32,
@@ -596,6 +597,7 @@ fn main() {
             Update,
             (
                 (
+                    round_clock,
                     player_input,
                     ai_drive,
                     ai_race,
@@ -873,15 +875,10 @@ fn start_round(
     }
 
     match track {
-        Some(t) => {
-            commands.insert_resource(t);
-            commands.insert_resource(Race { countdown: COUNTDOWN, clock: 0.0 });
-        }
-        None => {
-            commands.remove_resource::<Track>();
-            commands.remove_resource::<Race>();
-        }
+        Some(t) => commands.insert_resource(t),
+        None => commands.remove_resource::<Track>(),
     }
+    commands.insert_resource(Race { countdown: COUNTDOWN, clock: 0.0 });
 
     if sim.is_some() {
         return; // no player, no HUD
@@ -904,25 +901,24 @@ fn start_round(
             ..default()
         },
     ));
-    if def.is_race() {
-        commands.spawn((
-            RoundEntity,
-            Node {
-                position_type: PositionType::Absolute,
-                width: percent(100),
-                top: percent(30),
-                justify_content: JustifyContent::Center,
-                ..default()
-            },
-            children![(
-                CountdownText,
-                Text::new(""),
-                TextFont { font_size: FontSize::Px(110.0), ..default() },
-                TextColor(Color::srgb(0.95, 0.8, 0.3)),
-                TextShadow::default(),
-            )],
-        ));
-    }
+    // "3, 2, 1, GO!" in big letters.
+    commands.spawn((
+        RoundEntity,
+        Node {
+            position_type: PositionType::Absolute,
+            width: percent(100),
+            top: percent(30),
+            justify_content: JustifyContent::Center,
+            ..default()
+        },
+        children![(
+            CountdownText,
+            Text::new(""),
+            TextFont { font_size: FontSize::Px(110.0), ..default() },
+            TextColor(Color::srgb(0.95, 0.8, 0.3)),
+            TextShadow::default(),
+        )],
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -2039,26 +2035,33 @@ fn ai_race(
     }
 }
 
+/// Count down "3, 2, 1, go" at the start of a round, then run the clock.
+fn round_clock(time: Res<Time>, race: Option<ResMut<Race>>, mut sounds: ResMut<Sounds>) {
+    let Some(mut race) = race else { return };
+    let dt = time.delta_secs();
+    if race.started() {
+        race.clock += dt;
+        return;
+    }
+    let before = race.countdown.ceil();
+    race.countdown -= dt;
+    if race.countdown <= 0.0 {
+        sounds.play(Sfx::Go, 0.8);
+    } else if race.countdown.ceil() < before {
+        sounds.play(Sfx::Beep, 0.7);
+    }
+}
+
 /// Track every car's progress round the circuit: laps, lap times, finish.
 fn track_progress(
-    time: Res<Time>,
     track: Res<Track>,
-    mut race: ResMut<Race>,
+    race: Res<Race>,
     mut sounds: ResMut<Sounds>,
     mut cars: Query<(&Transform, &Car, &mut Racer, Has<Player>)>,
 ) {
-    let dt = time.delta_secs();
     if !race.started() {
-        let before = race.countdown.ceil();
-        race.countdown -= dt;
-        if race.countdown <= 0.0 {
-            sounds.play(Sfx::Go, 0.8);
-        } else if race.countdown.ceil() < before {
-            sounds.play(Sfx::Beep, 0.7);
-        }
         return;
     }
-    race.clock += dt;
     let full = track.length * track.laps as f32;
     for (tf, car, mut racer, is_player) in &mut cars {
         let spot = track.locate(tf.translation.truncate(), Some(racer.index));
@@ -2433,11 +2436,11 @@ fn static_collisions(
     art: Res<Art>,
     mut rng: ResMut<Rng>,
     mut sounds: ResMut<Sounds>,
-    race: Option<Res<Race>>,
+    track: Option<Res<Track>>,
     mut cars: Query<(&mut Transform, &mut Car, Has<Player>)>,
     mut obstacles: Query<(&Obstacle, Option<&mut Explosive>)>,
 ) {
-    let scale = if race.is_some() { RACE_CRASH_DAMAGE } else { 1.0 };
+    let scale = if track.is_some() { RACE_CRASH_DAMAGE } else { 1.0 };
     for (mut tf, mut car, is_player) in &mut cars {
         let reach = car.model.size.length() / 2.0;
         // (impact speed, damage factor, contact point, outward normal)
@@ -2534,10 +2537,10 @@ fn car_collisions(
     mut rng: ResMut<Rng>,
     mut score: ResMut<Score>,
     mut sounds: ResMut<Sounds>,
-    race: Option<Res<Race>>,
+    track: Option<Res<Track>>,
     mut q: Query<(&mut Transform, &mut Car, Has<Player>)>,
 ) {
-    let scale = if race.is_some() { RACE_CRASH_DAMAGE } else { 1.0 };
+    let scale = if track.is_some() { RACE_CRASH_DAMAGE } else { 1.0 };
     let mut combos = q.iter_combinations_mut();
     while let Some([(mut ta, mut a, a_player), (mut tb, mut b, b_player)]) = combos.fetch_next() {
         let (pa, pb) = (ta.translation.truncate(), tb.translation.truncate());
@@ -3494,14 +3497,14 @@ fn show_game_over(
     score: Res<Score>,
     mut sounds: ResMut<Sounds>,
     sim: Option<Res<Sim>>,
-    race: Option<Res<Race>>,
+    track: Option<Res<Track>>,
 ) {
     commands.insert_resource(GameOverAt(time.elapsed_secs()));
     if sim.is_some() {
         return;
     }
     let (green, red) = (Color::srgb(0.4, 1.0, 0.5), Color::srgb(1.0, 0.35, 0.3));
-    let (headline, color, details) = match (race.is_some(), score.place) {
+    let (headline, color, details) = match (track.is_some(), score.place) {
         (true, Some(place)) => (
             if place == 1 { "YOU WIN!".to_string() } else { format!("FINISHED {}", ordinal(place)) },
             if place == 1 { green } else { Color::srgb(0.95, 0.8, 0.3) },
