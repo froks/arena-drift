@@ -117,6 +117,8 @@ enum GameState {
     #[default]
     Menu,
     Garage,
+    /// Choosing the track (or derby arena), with a rendered view of it.
+    TrackSelect,
     Playing,
     GameOver,
 }
@@ -567,10 +569,13 @@ fn main() {
         // Dev shortcut: ARENA_DRIFT_AUTOSTART=1 skips the menu and garage.
         .insert_state(if autostart {
             GameState::Playing
-        } else if std::env::var_os("ARENA_DRIFT_GARAGE").is_some() {
-            GameState::Garage
         } else {
-            GameState::Menu
+            // Dev shortcut: ARENA_DRIFT_START=garage or tracks opens that screen.
+            match std::env::var("ARENA_DRIFT_START").as_deref() {
+                Ok("garage") => GameState::Garage,
+                Ok("tracks") => GameState::TrackSelect,
+                _ => GameState::Menu,
+            }
         })
         .init_resource::<CarArt>()
         .init_resource::<IconArt>()
@@ -582,6 +587,8 @@ fn main() {
         .add_systems(Update, menu_input.run_if(in_state(GameState::Menu)))
         .add_systems(OnEnter(GameState::Garage), setup_garage)
         .add_systems(Update, (garage_input, garage_animate).chain().run_if(in_state(GameState::Garage)))
+        .add_systems(OnEnter(GameState::TrackSelect), setup_track_select)
+        .add_systems(Update, track_select_input.run_if(in_state(GameState::TrackSelect)))
         .add_systems(OnEnter(GameState::Playing), start_round)
         .add_systems(Update, abort_round.run_if(in_state(GameState::Playing)))
         .add_systems(
@@ -1028,8 +1035,21 @@ fn menu_input(
 // Garage (car selection)
 // ---------------------------------------------------------------------------
 
+/// A car on show in the garage: its model, its own materials with their
+/// original colours (so it can be faded) and how faded it is now.
 #[derive(Component)]
-struct GarageCar(usize);
+struct GarageCar {
+    model: usize,
+    materials: Vec<(Handle<StandardMaterial>, Color)>,
+    alpha: f32,
+}
+
+/// The showroom floor's colour; faded cars blend towards it.
+const SHOWROOM_FLOOR: Color = Color::srgb(0.22, 0.19, 0.16);
+
+/// "TIER n" label beside a row of cars in the garage.
+#[derive(Component)]
+struct TierLabel(u8);
 
 #[derive(Component)]
 struct GarageInfo;
@@ -1055,7 +1075,12 @@ const STATS: [(&str, Color, Stat); 5] = [
 ];
 
 const GARAGE_SPACING: f32 = 260.0;
-const GARAGE_Y: f32 = 170.0;
+/// Height of the selected tier's row; the tiers above and below sit a row
+/// higher and lower, smaller and see-through.
+const GARAGE_Y: f32 = 138.0;
+const GARAGE_ROW: f32 = 142.0;
+/// Where the tier labels sit, left of the rows.
+const TIER_LABEL_X: f32 = -530.0;
 
 /// Where a model sits in the garage row of its tier.
 fn garage_slot(model: usize) -> f32 {
@@ -1080,7 +1105,7 @@ fn setup_garage(
     // Showroom floor: a gold-trimmed plinth.
     for (size, color, top) in [
         (Vec3::new(1232.0, 712.0, 20.0), Color::srgb(0.75, 0.6, 0.15), -1.0),
-        (Vec3::new(1200.0, 680.0, 20.0), Color::srgb(0.22, 0.19, 0.16), 0.0),
+        (Vec3::new(1200.0, 680.0, 20.0), SHOWROOM_FLOOR, 0.0),
     ] {
         commands.spawn((
             DespawnOnExit(GameState::Garage),
@@ -1094,7 +1119,6 @@ fn setup_garage(
         let x = garage_slot(i);
         let root = commands
             .spawn((
-                GarageCar(i),
                 DespawnOnExit(GameState::Garage),
                 Transform::from_xyz(x, GARAGE_Y, 0.0)
                     .with_rotation(Quat::from_rotation_z(std::f32::consts::FRAC_PI_2))
@@ -1102,7 +1126,24 @@ fn setup_garage(
             ))
             .id();
         let paint = cars::new_paint(&mut materials, model, model.look.paint);
-        cars::attach_car_visual(&mut commands, &car_art, i, &paint, root);
+        let own = cars::attach_car_visual_owned(&mut commands, &car_art, i, &paint, root, &mut materials);
+        let own = own.into_iter().map(|h| {
+            let color = materials.get(&h).map_or(Color::WHITE, |m| m.base_color);
+            (h, color)
+        });
+        commands.entity(root).insert(GarageCar { model: i, materials: own.collect(), alpha: 1.0 });
+    }
+    for tier in cars::tiers() {
+        commands.spawn((
+            DespawnOnExit(GameState::Garage),
+            TierLabel(tier),
+            Text::new(format!("TIER {tier}")),
+            TextFont { font_size: FontSize::Px(22.0), ..default() },
+            TextColor(Color::WHITE),
+            TextLayout::justify(Justify::Center),
+            Node { position_type: PositionType::Absolute, width: px(110), ..default() },
+            Visibility::Hidden,
+        ));
     }
 
     commands.spawn((
@@ -1194,18 +1235,12 @@ fn stat_fraction(value: f32, stat: Stat) -> f32 {
 fn garage_input(
     keys: Res<ButtonInput<KeyCode>>,
     mut selected: ResMut<SelectedCar>,
-    mut current: ResMut<CurrentArena>,
+    current: Res<CurrentArena>,
     mut next: ResMut<NextState<GameState>>,
     mut info: Query<&mut Text, (With<GarageInfo>, Without<GarageHelp>)>,
     mut help: Query<&mut Text, (With<GarageHelp>, Without<GarageInfo>)>,
     mut fills: Query<(&StatFill, &mut Node)>,
 ) {
-    if keys.just_pressed(KeyCode::Tab) {
-        // Next arena or track of the same kind.
-        let pool = arena::arenas_for(current.def().is_race());
-        let k = pool.iter().position(|&i| i == current.0).unwrap_or(0);
-        current.0 = pool[(k + 1) % pool.len()];
-    }
     if keys.just_pressed(KeyCode::Escape) {
         next.set(GameState::Menu);
     }
@@ -1232,24 +1267,18 @@ fn garage_input(
         selected.0 = row[col.min(row.len() - 1)];
     }
     if keys.any_just_pressed([KeyCode::Enter, KeyCode::Space]) {
-        next.set(GameState::Playing);
+        next.set(GameState::TrackSelect);
     }
 
     let Ok(mut text) = info.single_mut() else { return };
     let m = &MODELS[selected.0];
     let def = current.def();
-    let venue = match def.track() {
-        Some(t) => format!("Track: {} ({} laps)", def.name.to_uppercase(), t.laps),
-        None => format!("Arena: {}", def.name.to_uppercase()),
-    };
     let want = format!(
-        "TIER {}   <  {}  >\n{}\nRivals: {}\n\n{}  -  Tab to change\n{}",
+        "TIER {}   <  {}  >\n{}\nRivals: {}",
         m.tier,
         m.name.to_uppercase(),
         m.blurb,
         cars::tier_models(m.tier).iter().map(|&i| MODELS[i].name).collect::<Vec<_>>().join(", "),
-        venue,
-        def.blurb,
     );
     if text.0 != want {
         text.0 = want;
@@ -1263,8 +1292,8 @@ fn garage_input(
     }
     if let Ok(mut help) = help.single_mut() {
         let want = format!(
-            "Up/Down tier  |  Left/Right car  |  Enter/Space start  |  Esc menu\n\
-             Gamepad: D-pad choose  |  Y change {}  |  A start  |  B menu",
+            "Up/Down tier  |  Left/Right car  |  Enter/Space choose {}  |  Esc menu\n\
+             Gamepad: D-pad choose  |  A next  |  B menu",
             if def.is_race() { "track" } else { "arena" },
         );
         if help.0 != want {
@@ -1273,29 +1302,236 @@ fn garage_input(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Track (or arena) selection
+// ---------------------------------------------------------------------------
+
+#[derive(Component)]
+struct TrackInfo;
+
+/// Space kept free at the bottom of the screen for the track info (UI px).
+const TRACK_INFO_HEIGHT: f32 = 190.0;
+
+#[allow(clippy::too_many_arguments)]
+fn show_track(
+    commands: &mut Commands,
+    arena_art: &mut ArenaArt,
+    meshes: &mut Assets<Mesh>,
+    images: &mut Assets<Image>,
+    materials: &mut Assets<StandardMaterial>,
+    terrain: &mut Terrain,
+    def: &ArenaDef,
+    old: &Query<Entity, With<RoundEntity>>,
+) {
+    for e in old {
+        commands.entity(e).despawn();
+    }
+    let (_, ground, _) = arena::spawn_arena(commands, arena_art, meshes, images, materials, def);
+    *terrain = ground;
+}
+
+#[allow(clippy::too_many_arguments)]
+fn setup_track_select(
+    mut commands: Commands,
+    mut arena_art: ResMut<ArenaArt>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut images: ResMut<Assets<Image>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut terrain: ResMut<Terrain>,
+    current: Res<CurrentArena>,
+    old: Query<Entity, With<RoundEntity>>,
+) {
+    commands.remove_resource::<Track>();
+    commands.remove_resource::<Race>();
+    show_track(&mut commands, &mut arena_art, &mut meshes, &mut images, &mut materials, &mut terrain, current.def(), &old);
+    let race = current.def().is_race();
+    commands
+        .spawn((
+            DespawnOnExit(GameState::TrackSelect),
+            Node {
+                width: percent(100),
+                height: percent(100),
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::SpaceBetween,
+                padding: UiRect::vertical(px(4)),
+                ..default()
+            },
+        ))
+        .with_children(|root| {
+            root.spawn((
+                Text::new(if race { "CHOOSE A TRACK" } else { "CHOOSE AN ARENA" }),
+                TextFont { font_size: FontSize::Px(40.0), ..default() },
+                TextColor(Color::srgb(0.95, 0.8, 0.3)),
+                TextShadow::default(),
+            ));
+            root.spawn((
+                Node {
+                    width: percent(100),
+                    height: px(TRACK_INFO_HEIGHT),
+                    flex_direction: FlexDirection::Column,
+                    align_items: AlignItems::Center,
+                    justify_content: JustifyContent::Center,
+                    row_gap: px(8),
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.05, 0.05, 0.07, 0.85)),
+            ))
+            .with_children(|panel| {
+                panel.spawn((
+                    TrackInfo,
+                    Text::new(""),
+                    TextFont { font_size: FontSize::Px(22.0), ..default() },
+                    TextColor(Color::WHITE),
+                    TextLayout::justify(Justify::Center),
+                ));
+                panel.spawn((
+                    Text::new("Left/Right choose  |  Enter/Space start  |  Esc back to cars\nGamepad: D-pad choose  |  A start  |  B back"),
+                    TextFont { font_size: FontSize::Px(18.0), ..default() },
+                    TextColor(Color::srgb(0.65, 0.65, 0.65)),
+                    TextLayout::justify(Justify::Center),
+                ));
+            });
+        });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn track_select_input(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut commands: Commands,
+    mut arena_art: ResMut<ArenaArt>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut images: ResMut<Assets<Image>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut terrain: ResMut<Terrain>,
+    mut current: ResMut<CurrentArena>,
+    mut next: ResMut<NextState<GameState>>,
+    old: Query<Entity, With<RoundEntity>>,
+    mut info: Query<&mut Text, With<TrackInfo>>,
+) {
+    if keys.just_pressed(KeyCode::Escape) {
+        next.set(GameState::Garage);
+        return;
+    }
+    if keys.any_just_pressed([KeyCode::Enter, KeyCode::Space]) {
+        next.set(GameState::Playing);
+        return;
+    }
+    let pool = arena::arenas_for(current.def().is_race());
+    let k = pool.iter().position(|&i| i == current.0).unwrap_or(0);
+    let step = if keys.any_just_pressed([KeyCode::ArrowRight, KeyCode::KeyD, KeyCode::Tab]) {
+        1
+    } else if keys.any_just_pressed([KeyCode::ArrowLeft, KeyCode::KeyA]) {
+        pool.len() - 1
+    } else {
+        0
+    };
+    if step != 0 {
+        current.0 = pool[(k + step) % pool.len()];
+        show_track(&mut commands, &mut arena_art, &mut meshes, &mut images, &mut materials, &mut terrain, current.def(), &old);
+    }
+
+    let Ok(mut text) = info.single_mut() else { return };
+    let def = current.def();
+    let k = pool.iter().position(|&i| i == current.0).unwrap_or(0);
+    let details = match def.track() {
+        Some(t) => format!("{} laps", t.laps),
+        None => "Last car running wins".to_string(),
+    };
+    let want = format!(
+        "<   {}   >\n{}\n{}   ({} of {})",
+        def.name.to_uppercase(),
+        def.blurb,
+        details,
+        k + 1,
+        pool.len()
+    );
+    if text.0 != want {
+        text.0 = want;
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn garage_animate(
     time: Res<Time>,
     selected: Res<SelectedCar>,
+    ui_scale: Res<UiScale>,
     mut gizmos: Gizmos,
-    mut q: Query<(&GarageCar, &mut Transform, &mut Visibility)>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut q: Query<(&mut GarageCar, &mut Transform, &mut Visibility), Without<TierLabel>>,
+    mut labels: Query<(&TierLabel, &mut Node, &mut TextColor, &mut Visibility), Without<GarageCar>>,
+    camera: Single<(&Camera, &GlobalTransform), With<Camera3d>>,
 ) {
     let t = time.elapsed_secs();
-    let tier = MODELS[selected.0].tier;
-    for (car, mut tf, mut vis) in &mut q {
-        // Only the selected tier's row is on show.
-        *vis = if MODELS[car.0].tier == tier { Visibility::Inherited } else { Visibility::Hidden };
-        let up = std::f32::consts::FRAC_PI_2;
-        if car.0 == selected.0 {
-            tf.scale = Vec3::splat(2.5);
-            tf.rotation = Quat::from_rotation_z(up + (t * 1.5).sin() * 0.25);
+    let k = 1.0 - (-10.0 * time.delta_secs()).exp();
+    let tiers = cars::tiers();
+    let tier_pos = |tier: u8| tiers.iter().position(|&x| x == tier).unwrap_or(0) as i32;
+    let current = tier_pos(MODELS[selected.0].tier);
+    let up = std::f32::consts::FRAC_PI_2;
+    for (mut car, mut tf, mut vis) in &mut q {
+        // The selected tier in the middle; the next tier up above it and the
+        // one below beneath it, smaller and see-through. Others are hidden.
+        let rel = tier_pos(MODELS[car.model].tier) - current;
+        let shown = rel.abs() <= 1;
+        let want = if shown { Visibility::Inherited } else { Visibility::Hidden };
+        if *vis != want {
+            *vis = want;
+        }
+        let target_y = GARAGE_Y + rel as f32 * GARAGE_ROW;
+        let (scale, alpha) = match rel {
+            0 if car.model == selected.0 => (2.5, 1.0),
+            0 => (2.0, 1.0),
+            _ => (1.25, 0.45),
+        };
+        tf.translation.y += (target_y - tf.translation.y) * k;
+        let grow = (Vec3::splat(scale) - tf.scale) * k;
+        tf.scale += grow;
+        tf.rotation = if car.model == selected.0 {
+            Quat::from_rotation_z(up + (t * 1.5).sin() * 0.25)
+        } else {
+            Quat::from_rotation_z(up)
+        };
+        if car.model == selected.0 {
             gizmos.rect(
-                Isometry3d::from_translation(tf.translation.truncate().extend(1.0)),
-                Vec2::new(GARAGE_SPACING - 40.0, 210.0),
+                Isometry3d::from_translation(Vec3::new(tf.translation.x, GARAGE_Y, 1.0)),
+                Vec2::new(GARAGE_SPACING - 40.0, 140.0),
                 Color::srgb(0.95, 0.8, 0.3),
             );
-        } else {
-            tf.scale = Vec3::splat(2.0);
-            tf.rotation = Quat::from_rotation_z(up);
+        }
+        // "Fade" by blending every colour of the car towards the floor
+        // under it: it looks see-through, but stays opaque, so the parts
+        // still draw in the right order (real transparency sorts them by
+        // their centres and the roof ends up under the dark cabin glass).
+        let a = if shown { car.alpha + (alpha - car.alpha) * k } else { alpha };
+        let a = if (a - alpha).abs() < 0.01 { alpha } else { a };
+        if a != car.alpha {
+            car.alpha = a;
+            for (h, original) in &car.materials {
+                if let Some(mut m) = materials.get_mut(h) {
+                    m.base_color = SHOWROOM_FLOOR.mix(original, a);
+                }
+            }
+        }
+    }
+
+    // Tier labels beside the rows, placed where the camera shows that row.
+    let (cam, cam_tf) = camera.into_inner();
+    for (label, mut node, mut color, mut vis) in &mut labels {
+        let rel = tier_pos(label.0) - current;
+        let want = if rel.abs() <= 1 { Visibility::Inherited } else { Visibility::Hidden };
+        if *vis != want {
+            *vis = want;
+        }
+        let world = Vec3::new(TIER_LABEL_X, GARAGE_Y + rel as f32 * GARAGE_ROW, 0.0);
+        let Ok(at) = cam.world_to_viewport(cam_tf, world) else { continue };
+        let (left, top) = (px(at.x / ui_scale.0 - 55.0), px(at.y / ui_scale.0 - 14.0));
+        if node.left != left || node.top != top {
+            node.left = left;
+            node.top = top;
+        }
+        let c = if rel == 0 { Color::srgb(0.95, 0.8, 0.3) } else { Color::srgba(1.0, 1.0, 1.0, 0.45) };
+        if color.0 != c {
+            color.0 = c;
         }
     }
 }
@@ -2994,6 +3230,7 @@ fn camera_follow(
     player: Query<(&Transform, &Car), (With<Player>, Without<Camera3d>)>,
     camera: Single<&mut Transform, (With<Camera3d>, Without<Car>)>,
     light: Single<&mut bevy::light::CascadeShadowConfig>,
+    ui_scale: Res<UiScale>,
     mut zoom: Local<Option<f32>>,
     mut ground: Local<f32>,
 ) {
@@ -3001,10 +3238,18 @@ fn camera_follow(
     let view = Vec2::new(window.width(), window.height()).max(Vec2::ONE);
 
     let showroom = matches!(state.get(), GameState::Garage | GameState::Menu);
+    let preview = *state.get() == GameState::TrackSelect;
     let (target, target_zoom, target_ground, snap) = if showroom {
         // The showroom is laid out for 1280x800; fit it to whatever the window is.
         let fit = (Vec2::new(1280.0, 800.0) / view).max_element().max(1.0);
         (Vec2::new(0.0, 24.0), fit, 0.0, true)
+    } else if preview {
+        // The whole track above the info panel at the bottom.
+        let arena = current.def().size + Vec2::splat(120.0);
+        let free = view - Vec2::new(0.0, (TRACK_INFO_HEIGHT + 50.0) * ui_scale.0);
+        let fit = (arena / free.max(Vec2::ONE)).max_element();
+        let lift = (TRACK_INFO_HEIGHT - 50.0) * ui_scale.0 / 2.0 * fit;
+        (Vec2::new(0.0, -lift), fit, terrain.height(Vec2::ZERO), true)
     } else {
         let arena = current.def().size;
         match player.single() {
@@ -3029,7 +3274,7 @@ fn camera_follow(
     let mut pos = tf.translation.truncate();
     pos += (target - pos) * k;
 
-    if !showroom {
+    if !showroom && !preview {
         // Don't show more than a strip of the outfield.
         let arena = current.def().size;
         let room = arena / 2.0 + Vec2::splat(160.0) - view / 2.0 * *z;

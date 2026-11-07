@@ -113,7 +113,7 @@ pub static ARENAS: [ArenaDef; 6] = [
     },
     ArenaDef {
         name: "Dustline Speedway",
-        blurb: "Fast sweepers round a dusty oval, with a kink on the back straight. Flat out.",
+        blurb: "Fast sweepers round a dusty oval, a kink on the back straight and a ramp to fly off.",
         mode: Mode::Race(&track::DUSTLINE),
         size: Vec2::new(3900.0, 2300.0),
         theme: Theme {
@@ -129,7 +129,7 @@ pub static ARENAS: [ArenaDef; 6] = [
     },
     ArenaDef {
         name: "Red Canyon",
-        blurb: "Long and technical: a hairpin drops into the canyon and climbs back out.",
+        blurb: "Long and technical: a hairpin into the canyon, and a ravine to jump. Hit the boost.",
         mode: Mode::Race(&track::RED_CANYON),
         size: Vec2::new(4000.0, 2600.0),
         theme: Theme {
@@ -145,7 +145,7 @@ pub static ARENAS: [ArenaDef; 6] = [
     },
     ArenaDef {
         name: "Pine Ridge",
-        blurb: "Through the woods, over the hills, and a quick S-bend on the far side.",
+        blurb: "Through the woods and over a river twice: once on a bridge, once through a ford.",
         mode: Mode::Race(&track::PINE_RIDGE),
         size: Vec2::new(3800.0, 2400.0),
         theme: Theme {

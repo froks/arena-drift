@@ -15,7 +15,8 @@ build it yourself (see below).
 
 ## Features
 
-- **Two modes.** The start menu offers *New race* and *Arena* (demolition derby).
+- **Two modes.** The start menu offers *New race* and *Arena* (demolition derby). After picking a car you pick
+  the track or arena from a rendered overview of each.
 - **Race mode.** Four cars line up on a grid behind the start/finish line, wait out a 3-2-1 countdown and race a
   few laps. The HUD shows your position, lap, race time and best lap. The AI drivers race rather than hunt: they
   brake for corners, take the inside line, overtake and detour for power-ups near the racing line. They still shoot
@@ -68,9 +69,11 @@ build it yourself (see below).
 | | Enter or Space | Go to the garage |
 | Garage | Up / Down | Change tier |
 | | Left / Right | Choose a car |
-| | Tab | Change arena or track |
-| | Enter or Space | Start the match |
+| | Enter or Space | On to choosing the track or arena |
 | | Esc | Back to the menu |
+| Track / arena choice | Left / Right (or Tab) | Choose; the view shows the whole track |
+| | Enter or Space | Start the match |
+| | Esc | Back to the garage |
 | Driving | W / Up | Throttle |
 | | S / Down | Brake, then reverse |
 | | A / D or Left / Right | Steer |
@@ -94,7 +97,6 @@ buttons):
 | Menus | D-pad or left stick | Choose |
 | | A or Start | Confirm |
 | | B | Back |
-| | Y or Select | Change arena or track |
 
 ## Building and running
 
@@ -175,7 +177,7 @@ These environment variables help with testing and balancing:
 | Variable | Effect |
 |---|---|
 | `ARENA_DRIFT_AUTOSTART=1` | Skip the menu and garage and go straight into a match. |
-| `ARENA_DRIFT_GARAGE=1` | Start in the garage instead of the menu. |
+| `ARENA_DRIFT_START=garage` or `tracks` | Start in the garage or on the track selection screen instead of the menu. |
 | `ARENA_DRIFT_ARENA=<n>` | Start in arena `n`: 0 is Dust Bowl, 1 is Junkyard, 2 is Timberland, 3 is Dustline Speedway, 4 is Red Canyon, 5 is Pine Ridge. |
 | `ARENA_DRIFT_SIM=<rounds>` | Balance simulation: AI-only rounds at 3× speed with sound off. Prints each round's winner and a win table at the end. On a track it also prints every car's finishing time and best lap. |
 | `ARENA_DRIFT_SIM_TIER=<t>` | With `ARENA_DRIFT_SIM`, fill the field with one tier's cars only. |

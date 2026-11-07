@@ -701,6 +701,41 @@ pub fn attach_car_visual(commands: &mut Commands, art: &CarArt, model_index: usi
     });
 }
 
+/// Like [`attach_car_visual`], but every material is the car's own copy, so
+/// the car can be faded on its own (the garage does that). Returns them all.
+pub fn attach_car_visual_owned(
+    commands: &mut Commands,
+    art: &CarArt,
+    model_index: usize,
+    paint: &Paint,
+    root: Entity,
+    materials: &mut Assets<StandardMaterial>,
+) -> Vec<Handle<StandardMaterial>> {
+    let mut own: Vec<(Handle<StandardMaterial>, Handle<StandardMaterial>)> = Vec::new();
+    let mut all: Vec<Handle<StandardMaterial>> = paint.handles.to_vec();
+    commands.entity(root).insert(Visibility::default()).with_children(|parent| {
+        for part in &art.parts[model_index] {
+            let material = match &part.slot {
+                Slot::Fixed(h) => match own.iter().find(|(shared, _)| shared == h) {
+                    Some((_, mine)) => mine.clone(),
+                    None => {
+                        let copy = materials.get(h).cloned().unwrap_or_default();
+                        let mine = materials.add(copy);
+                        own.push((h.clone(), mine.clone()));
+                        all.push(mine.clone());
+                        mine
+                    }
+                },
+                Slot::Paint => paint.handles[0].clone(),
+                Slot::PaintDark => paint.handles[1].clone(),
+                Slot::Accent => paint.handles[2].clone(),
+            };
+            parent.spawn((Mesh3d(part.mesh.clone()), MeshMaterial3d(material), part.transform));
+        }
+    });
+    all
+}
+
 /// Front wheels turn with the steering input.
 pub fn steer_front_wheels(cars: Query<&Car>, mut wheels: Query<(&ChildOf, &mut Transform), With<FrontWheel>>) {
     for (child_of, mut tf) in &mut wheels {
