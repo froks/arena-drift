@@ -11,6 +11,7 @@ use std::f32::consts::{FRAC_PI_2, TAU};
 use bevy::prelude::*;
 
 use crate::RoundEntity;
+use crate::music::Song;
 use crate::physics::{Contact, Obb};
 use crate::terrain::{Canvas, Cut, Deck, DeckKind, Terrain, berm, bump, smoothstep};
 use crate::track::{self, BARRIER, BOOST_PAD, Track, TrackDef};
@@ -43,6 +44,8 @@ pub struct ArenaDef {
     pub build: fn(&mut Layout),
     /// Ground height at a point, given the arena size. See [`crate::terrain`].
     pub relief: fn(Vec2, Vec2) -> f32,
+    /// The song that plays here.
+    pub music: Song,
 }
 
 impl ArenaDef {
@@ -78,6 +81,7 @@ pub static ARENAS: [ArenaDef; 6] = [
         seed: 11,
         build: dust_bowl,
         relief: dust_bowl_relief,
+        music: Song::DustBowl,
     },
     ArenaDef {
         name: "Junkyard",
@@ -94,6 +98,7 @@ pub static ARENAS: [ArenaDef; 6] = [
         seed: 23,
         build: junkyard,
         relief: junkyard_relief,
+        music: Song::Junkyard,
     },
     ArenaDef {
         name: "Timberland",
@@ -110,6 +115,7 @@ pub static ARENAS: [ArenaDef; 6] = [
         seed: 37,
         build: timberland,
         relief: timberland_relief,
+        music: Song::Timberland,
     },
     ArenaDef {
         name: "Dustline Speedway",
@@ -126,6 +132,7 @@ pub static ARENAS: [ArenaDef; 6] = [
         seed: 51,
         build: dustline,
         relief: dustline_relief,
+        music: Song::Dustline,
     },
     ArenaDef {
         name: "Red Canyon",
@@ -142,6 +149,7 @@ pub static ARENAS: [ArenaDef; 6] = [
         seed: 67,
         build: red_canyon,
         relief: red_canyon_relief,
+        music: Song::RedCanyon,
     },
     ArenaDef {
         name: "Pine Ridge",
@@ -158,6 +166,7 @@ pub static ARENAS: [ArenaDef; 6] = [
         seed: 83,
         build: pine_ridge,
         relief: pine_ridge_relief,
+        music: Song::PineRidge,
     },
 ];
 

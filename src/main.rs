@@ -11,6 +11,7 @@ mod arena;
 mod cars;
 mod icons;
 mod minimap;
+mod music;
 mod physics;
 mod sound;
 mod terrain;
@@ -551,7 +552,7 @@ fn main() {
             }),
             ..default()
         }))
-        .add_plugins((SoundPlugin, MinimapPlugin))
+        .add_plugins((SoundPlugin, music::MusicPlugin, MinimapPlugin))
         .insert_resource(CurrentArena(arena.min(ARENAS.len() - 1)))
         .init_resource::<SkidMarks>()
         .insert_resource(ClearColor(Color::srgb(0.08, 0.08, 0.1)))
@@ -994,7 +995,7 @@ fn setup_menu(mut commands: Commands, mut terrain: ResMut<Terrain>, old: Query<E
                 ));
             }
             root.spawn((
-                Text::new("Up/Down choose  |  Enter select  (gamepad: D-pad, A)"),
+                Text::new("Up/Down choose  |  Enter select  (gamepad: D-pad, A)  |  N music on/off"),
                 TextFont { font_size: FontSize::Px(20.0), ..default() },
                 TextColor(Color::srgb(0.6, 0.6, 0.6)),
                 Node { margin: UiRect::top(px(30)), ..default() },
@@ -2094,7 +2095,7 @@ fn race_hazards(
             if d.dot(dir).abs() < half.x && d.dot(dir.perp()).abs() < half.y {
                 // A kick on the way in, then turbo for a moment.
                 if armory.turbo < BOOST_SECONDS - 0.3 {
-                    sounds.play(Sfx::Turbo, vol);
+                    sounds.play_at(Sfx::Boost, vol, pos);
                     let fwd = car.forward();
                     let top = car.model.top_speed * 1.4;
                     car.vel = (car.vel + fwd * BOOST_KICK).clamp_length_max(top);
@@ -2153,7 +2154,7 @@ fn race_hazards(
         racer.progress = s;
         racer.index = track.locate(at, None).index;
         racer.lateral = 0.0;
-        sounds.play(Sfx::Crash, vol * 0.6);
+        sounds.play_at(Sfx::Crash, vol * 0.6, pos);
     }
 }
 
@@ -2355,7 +2356,12 @@ fn car_physics(
 /// Keep every car on the ground under it, pitched and rolled with the slope;
 /// when the ground falls away faster than gravity (a ramp's lip, a ravine),
 /// it flies.
-fn follow_terrain(time: Res<Time>, terrain: Res<Terrain>, mut q: Query<(&mut Transform, &mut Car)>) {
+fn follow_terrain(
+    time: Res<Time>,
+    terrain: Res<Terrain>,
+    mut sounds: ResMut<Sounds>,
+    mut q: Query<(&mut Transform, &mut Car)>,
+) {
     let dt = time.delta_secs().max(1e-4);
     for (mut tf, mut car) in &mut q {
         let pos = tf.translation.truncate();
@@ -2364,6 +2370,10 @@ fn follow_terrain(time: Res<Time>, terrain: Res<Terrain>, mut q: Query<(&mut Tra
         car.vz -= FALL_GRAVITY * dt;
         let mut z = before + car.vz * dt;
         if z <= ground {
+            // Coming down hard from a jump.
+            if car.airborne && car.vz < -150.0 {
+                sounds.play_at(Sfx::Land, (-car.vz / 500.0).min(1.0), pos);
+            }
             // On the ground: ride along with it. A big step up (a wall, the
             // far side of a ravine) just puts the car on top.
             let climb = if ground - before > 30.0 { 0.0 } else { (ground - before) / dt };
@@ -2446,7 +2456,7 @@ fn static_collisions(
         let Some((impact, factor, point, normal)) = worst else { continue };
         if impact > 60.0 {
             let soft = 0.4 + 0.6 * factor.min(1.0);
-            sounds.play(Sfx::Crash, (impact / 600.0) * soft * if is_player { 1.0 } else { 0.5 });
+            sounds.play_at(Sfx::Crash, (impact / 600.0) * soft, point);
         }
         if impact > DAMAGE_THRESHOLD * 1.5 && car.alive() {
             let dmg = (impact - DAMAGE_THRESHOLD * 1.5) * WALL_DAMAGE_SCALE * factor * scale / car.model.armor;
@@ -2542,8 +2552,7 @@ fn car_collisions(
         b.apply_impulse(n * j, rb);
 
         if closing > 40.0 {
-            let near = if a_player || b_player { 1.0 } else { 0.55 };
-            sounds.play(Sfx::Crash, (0.15 + closing / 500.0) * near);
+            sounds.play_at(Sfx::Crash, 0.15 + closing / 500.0, contact.point);
         }
 
         // Damage follows how hard each car got jolted, so heavy cars shrug
@@ -2614,7 +2623,7 @@ fn fire_weapons(
         match armory.weapon {
             Weapon::None => continue,
             Weapon::Guns => {
-                sounds.play(Sfx::Gun, vol * 0.6);
+                sounds.play_at(Sfx::Gun, vol * 0.6, pos);
                 armory.cooldown = GUN_COOLDOWN;
                 let dir = fwd.rotate(Vec2::from_angle(rng.range(-0.04, 0.04)));
                 let vel = dir * (GUN_SPEED + fwd_speed);
@@ -2628,7 +2637,7 @@ fn fire_weapons(
                 ));
             }
             Weapon::Rockets => {
-                sounds.play(Sfx::Rocket, vol);
+                sounds.play_at(Sfx::Rocket, vol, pos);
                 armory.cooldown = ROCKET_COOLDOWN;
                 let vel = fwd * (ROCKET_START_SPEED + fwd_speed);
                 let rocket = commands
@@ -2642,7 +2651,7 @@ fn fire_weapons(
                 icons::attach_rocket(&mut commands, &icon_art, rocket);
             }
             Weapon::Mines => {
-                sounds.play(Sfx::MineDrop, vol);
+                sounds.play_at(Sfx::MineDrop, vol, pos);
                 armory.cooldown = MINE_COOLDOWN;
                 let tail = pos - fwd * (half_len + 14.0);
                 let mine = commands
@@ -2727,7 +2736,7 @@ fn move_projectiles(
             ProjectileKind::Bullet => {
                 if let Some((mut car, is_player)) = hit_car {
                     hurt(&mut car, GUN_DAMAGE, shot.by_player && !is_player, &mut score);
-                    sounds.play(Sfx::BulletHit, if shot.by_player || is_player { 0.5 } else { 0.25 });
+                    sounds.play_at(Sfx::BulletHit, 0.5, pos);
                     let push = 25.0 / car.mass();
                     car.vel += shot.vel.normalize_or_zero() * push;
                     spawn_sparks(&mut commands, &art, &mut rng, tf.translation, -shot.vel.normalize_or_zero(), 30.0);
@@ -2808,7 +2817,7 @@ fn resolve_blasts(
     mut barrels: Query<(&Obstacle, &mut Explosive)>,
 ) {
     for blast in blasts.0.drain(..) {
-        sounds.play(Sfx::Explosion, 0.9);
+        sounds.play_at(Sfx::Explosion, 1.0, blast.pos);
         // Barrels caught in a blast go off next frame: chain reactions.
         for (o, mut barrel) in &mut barrels {
             let d = o.distance(blast.pos);
@@ -2936,7 +2945,11 @@ fn collect_pickups(
                 PickupKind::Turbo => Sfx::Turbo,
                 _ => Sfx::WeaponPickup,
             };
-            sounds.play(sfx, if is_player { 0.8 } else { 0.3 });
+            if is_player {
+                sounds.play(sfx, 0.8);
+            } else {
+                sounds.play_at(sfx, 0.4, ppos);
+            }
             let (weapon, ammo) = match pickup.0 {
                 PickupKind::Health => {
                     car.hp = (car.hp + HEALTH_PACK).min(car.model.max_hp);
@@ -3028,7 +3041,7 @@ fn update_car_visuals(
         }
         if !car.alive() && !car.wrecked {
             car.wrecked = true;
-            sounds.play(Sfx::Wreck, 1.0);
+            sounds.play_at(Sfx::Wreck, 1.0, tf.translation.truncate());
             if let Some(mut icon) = icon {
                 icon.color = Color::srgb(0.3, 0.3, 0.3);
                 icon.layer = 2;

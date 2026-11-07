@@ -35,8 +35,8 @@ build it yourself (see below).
 - **Damage that depends on the hit.** Ramming nose-first hurts the other car more than you, and taking a hit in
   the side hurts the most. Heavy cars shrug off hits from light ones. Damaged cars darken and smoke, and wrecks
   stay in the arena as obstacles.
-- **12 cars in 3 tiers.** Each has its own size, weight, handling and toughness. Your rivals always come from your
-  tier.
+- **12 cars in 3 tiers.** Each has its own size, weight, handling and toughness, shown as bars in the garage,
+  where the tiers above and below yours are on show too. Your rivals always come from your tier.
 - **3D arenas with real terrain.** Everything is built from 3D shapes and lit by a low sun that casts shadows.
   The camera looks straight down, but tall things lean out and slide past as you drive (parallax). Slopes pull
   cars downhill, so valleys collect wrecks.
@@ -50,16 +50,27 @@ build it yourself (see below).
 - **Power-ups:** health packs, a machine gun, rockets, mines and turbo.
 - **Camera and minimap.** The camera follows your car and zooms out with speed, a minimap shows the whole arena,
   and sliding cars leave skid marks.
-- **Generated sound.** Every sound effect, including the engine, is synthesised in code, so the game ships with no
-  audio files.
+- **Generated synthpop soundtrack.** Every arena and track has its own fast synthpop song (four-on-the-floor
+  drums, bouncing bass, pumping supersaw chords, arpeggios and a lead hook, arranged into intro, verse, chorus
+  and breakdown), and the menus have a calmer one. The track selection screen plays each track's song as you
+  browse. Songs crossfade between screens, and `N` switches music off and on.
+- **Generated sound.** Every sound effect and the engine are synthesised in code too, so the game ships with no
+  audio files. Sounds from other cars get quieter with distance; your tyres screech when you really slide, water
+  splashes when you drive through it, landings thump and boost pads whoosh. Crashes and explosions come in
+  several variations.
+- **Gamepads** work natively and in the browser, with analog steering and throttle.
 
-| Garage | Junkyard |
+| Menu | Garage |
 |---|---|
-| ![Garage](docs/screenshots/garage.png) | ![Junkyard](docs/screenshots/junkyard.png) |
+| ![Menu](docs/screenshots/menu.png) | ![Garage](docs/screenshots/garage.png) |
+| **Choosing a track** | **Race start (Dustline Speedway)** |
+| ![Track selection](docs/screenshots/track-select.png) | ![Race start](docs/screenshots/race-start.png) |
+| **Red Canyon** | **The ravine jump** |
+| ![Red Canyon overview](docs/screenshots/red-canyon-overview.png) | ![Ramp, boost pad and ravine](docs/screenshots/red-canyon-jump.png) |
+| **Splashing through the ford (Pine Ridge)** | **Junkyard** |
+| ![Cars in the ford](docs/screenshots/pine-ridge-ford.png) | ![Junkyard](docs/screenshots/junkyard.png) |
 | **Dust Bowl** | **Timberland** |
 | ![Dust Bowl overview](docs/screenshots/dust-bowl-overview.png) | ![Timberland overview](docs/screenshots/timberland-overview.png) |
-| **Race start (Dustline Speedway)** | **Red Canyon** |
-| ![Race start](docs/screenshots/race-start.png) | ![Red Canyon overview](docs/screenshots/red-canyon-overview.png) |
 
 ## Controls
 
@@ -80,6 +91,7 @@ build it yourself (see below).
 | | Space | Handbrake |
 | | Ctrl, F, C or V | Fire the current weapon |
 | | Esc | Leave the race or match, back to the menu |
+| Anywhere | N | Music on/off |
 | After a match | Enter | Rematch |
 | | G | Back to the garage |
 | | M / Esc | Back to the menu |
@@ -169,6 +181,8 @@ The tests cover:
   across the start line. Boost pads are on the track and ramps on straights, ravines are deep enough to need a
   jump, the bridge stays dry, the ford is shallow, and nothing else is under water.
 - Engine sound: the loops repeat without a click, and the revs drop on gear changes.
+- Music: every song loops seamlessly and isn't silent, every arena and track has its own song, and scale degrees
+  map to the right notes.
 
 ## Developer options
 
@@ -183,6 +197,12 @@ These environment variables help with testing and balancing:
 | `ARENA_DRIFT_SIM_TIER=<t>` | With `ARENA_DRIFT_SIM`, fill the field with one tier's cars only. |
 | `ARENA_DRIFT_SCREENSHOT=<file>:<secs>` | Save a screenshot of the game window after `secs` seconds. |
 | `ARENA_DRIFT_LOOK=<x>,<y>,<zoom>` | With `ARENA_DRIFT_SIM`, point the camera at that spot instead of showing the whole arena. |
+
+To listen to the generated audio outside the game, write every song and the main sound effects to WAV files:
+
+```sh
+SOUND_DUMP_DIR=/tmp/arena-drift-audio cargo test --release dump_ -- --ignored
+```
 
 For example, to check balance within tier 2 on the Junkyard:
 
@@ -211,7 +231,8 @@ SIM   T2 Razorback    11 wins / 120 cars entered =   9.2% per car (fair 16.7%)
 | `src/physics.rs` | Oriented-box collision geometry |
 | `src/icons.rs` | Power-up badges, rockets and mines |
 | `src/minimap.rs` | The corner minimap |
-| `src/sound.rs` | Synthesised sound effects and the engine loop |
+| `src/sound.rs` | Synthesised sound effects, the engine, tyre and splash loops |
+| `src/music.rs` | The synthpop soundtrack: songs arranged from chord progressions and synthesised at runtime |
 | `index.html` | Web page for the browser build (Trunk entry point) |
 | `.github/workflows/pages.yml` | Builds the web version and deploys it to GitHub Pages |
 | `.github/workflows/ci.yml` | Builds and tests on Linux, Windows and macOS, and uploads the binaries |

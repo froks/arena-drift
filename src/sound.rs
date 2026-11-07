@@ -1,8 +1,11 @@
-//! Procedurally generated sound effects.
+//! Procedurally generated sound effects (and, in [`crate::music`], music).
 //!
 //! Every sound is synthesised at startup and handed to Bevy as an in-memory WAV,
 //! so the game ships without any audio files. Gameplay code queues sounds with
-//! [`Sounds::play`]; [`play_sounds`] turns the queue into audio entities.
+//! [`Sounds::play`] (heard at full volume) or [`Sounds::play_at`] (quieter the
+//! further it is from the camera); [`play_sounds`] turns the queue into audio
+//! entities. The player's engine, tyre screech and water splashing are loops
+//! whose volume follows the car.
 
 use std::f32::consts::{PI, TAU};
 use std::sync::Arc;
@@ -10,9 +13,10 @@ use std::sync::Arc;
 use bevy::audio::Volume;
 use bevy::prelude::*;
 
+use crate::terrain::Terrain;
 use crate::{Armory, Car, GameState, Player, Rng};
 
-const RATE: u32 = 22_050;
+pub(crate) const RATE: u32 = 22_050;
 const MASTER_VOLUME: f32 = 0.6;
 const ENGINE_VOLUME: f32 = 0.3;
 
@@ -43,33 +47,59 @@ pub enum Sfx {
     Beep,
     /// ...and "go".
     Go,
+    /// Landing after a jump.
+    Land,
+    /// Driving over a boost pad.
+    Boost,
 }
 
 impl Sfx {
-    const COUNT: usize = 14;
+    const COUNT: usize = 16;
 
     /// Small random pitch changes keep repeated sounds from getting tiring.
     fn pitch_jitter(self) -> f32 {
         match self {
-            Sfx::Crash | Sfx::Gun | Sfx::BulletHit | Sfx::Explosion | Sfx::Wreck => 0.12,
+            Sfx::Crash | Sfx::Gun | Sfx::BulletHit | Sfx::Explosion | Sfx::Wreck | Sfx::Land => 0.12,
             Sfx::Rocket | Sfx::MineDrop => 0.06,
             _ => 0.0,
         }
     }
 }
 
-/// Sounds requested this frame: (sound, volume 0..1).
+/// Sounds requested this frame: (sound, volume 0..1, where it happened).
 #[derive(Resource, Default)]
-pub struct Sounds(Vec<(Sfx, f32)>);
+pub struct Sounds(Vec<(Sfx, f32, Option<Vec2>)>);
 
 impl Sounds {
+    /// A sound heard at the same volume wherever it comes from (UI, the
+    /// player's own pickups).
     pub fn play(&mut self, sfx: Sfx, volume: f32) {
-        self.0.push((sfx, volume.clamp(0.0, 1.0)));
+        self.0.push((sfx, volume.clamp(0.0, 1.0), None));
+    }
+    /// A sound at a place in the world: quieter the further it is from the
+    /// middle of the screen.
+    pub fn play_at(&mut self, sfx: Sfx, volume: f32, at: Vec2) {
+        self.0.push((sfx, volume.clamp(0.0, 1.0), Some(at)));
     }
 }
 
+/// How far away (in world units) a sound has dropped to half volume.
+const HALF_VOLUME_DISTANCE: f32 = 650.0;
+
+fn distance_gain(d: f32) -> f32 {
+    1.0 / (1.0 + (d / HALF_VOLUME_DISTANCE).powi(2))
+}
+
+/// Every sound, with one or more variants to pick from at random.
 #[derive(Resource)]
-struct SfxBank([Handle<AudioSource>; Sfx::COUNT]);
+struct SfxBank(Vec<Vec<Handle<AudioSource>>>);
+
+/// A loop that follows the player's car: tyre screech or water splashing.
+#[derive(Component, Clone, Copy, PartialEq, Eq)]
+enum CarLoop {
+    Screech,
+    Splash,
+}
 
 /// One layer of the player's engine sound, recorded at `base_rpm`.
 #[derive(Component)]
@@ -90,7 +120,7 @@ impl Plugin for SoundPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Sounds>()
             .add_systems(Startup, build_sounds)
-            .add_systems(Update, (play_sounds, engine_sound));
+            .add_systems(Update, (play_sounds, engine_sound, car_loops));
     }
 }
 
@@ -98,23 +128,34 @@ fn build_sounds(mut commands: Commands, mut sources: ResMut<Assets<AudioSource>>
     let mut add = |samples: Vec<f32>| {
         sources.add(AudioSource { bytes: Arc::from(to_wav(&normalize(samples))) })
     };
-    // Order must match the `Sfx` enum.
-    let bank = [
-        add(crash(0.45)),
-        add(gun()),
-        add(bullet_hit()),
-        add(rocket()),
-        add(mine_drop()),
-        add(explosion(1.4)),
-        add(health()),
-        add(weapon_pickup()),
-        add(turbo()),
-        add(wreck()),
-        add(win()),
-        add(lose()),
-        add(beep(440.0, 0.25)),
-        add(beep(880.0, 0.6)),
+    // Order must match the `Sfx` enum. Crashes come in a few variants so a
+    // pile-up doesn't sound like one sample on repeat.
+    let bank = vec![
+        (0..4).map(|v| add(crash(0.45 + 0.08 * v as f32, v))).collect(),
+        vec![add(gun())],
+        vec![add(bullet_hit())],
+        vec![add(rocket())],
+        vec![add(mine_drop())],
+        (0..2).map(|v| add(explosion(1.6, v))).collect(),
+        vec![add(health())],
+        vec![add(weapon_pickup())],
+        vec![add(turbo())],
+        vec![add(wreck())],
+        vec![add(win())],
+        vec![add(lose())],
+        vec![add(beep(440.0, 0.25))],
+        vec![add(beep(880.0, 0.6))],
+        vec![add(land())],
+        vec![add(boost())],
     ];
+    assert_eq!(bank.len(), Sfx::COUNT);
+    for (kind, samples) in [(CarLoop::Screech, screech_loop()), (CarLoop::Splash, splash_loop())] {
+        commands.spawn((
+            kind,
+            AudioPlayer(add(samples)),
+            PlaybackSettings { volume: Volume::Linear(0.0), ..PlaybackSettings::LOOP },
+        ));
+    }
     for base_rpm in ENGINE_LAYERS {
         let handle = add(engine_loop(base_rpm));
         commands.spawn((
@@ -132,6 +173,7 @@ fn play_sounds(
     bank: Option<Res<SfxBank>>,
     mut rng: ResMut<Rng>,
     sim: Option<Res<crate::Sim>>,
+    camera: Query<&Transform, With<Camera3d>>,
 ) {
     let Some(bank) = bank else { return };
     if sim.is_some() {
@@ -146,7 +188,9 @@ fn play_sounds(
     // e.g. six cars hitting the same wall don't stack into a wall of noise.
     let mut loudest = [0.0_f32; Sfx::COUNT];
     let mut order = Vec::new();
-    for (sfx, vol) in queue.0.drain(..) {
+    let listener = camera.single().map_or(Vec2::ZERO, |t| t.translation.truncate());
+    for (sfx, vol, at) in queue.0.drain(..) {
+        let vol = vol * at.map_or(1.0, |p| distance_gain(p.distance(listener)));
         let i = sfx as usize;
         if loudest[i] == 0.0 {
             order.push(sfx);
@@ -155,14 +199,58 @@ fn play_sounds(
     }
     for sfx in order {
         let jitter = sfx.pitch_jitter();
+        let variants = &bank.0[sfx as usize];
+        let pick = ((rng.next_f32() * variants.len() as f32) as usize).min(variants.len() - 1);
         commands.spawn((
-            AudioPlayer(bank.0[sfx as usize].clone()),
+            AudioPlayer(variants[pick].clone()),
             PlaybackSettings {
                 volume: Volume::Linear(loudest[sfx as usize] * MASTER_VOLUME),
                 speed: 1.0 + rng.range(-jitter, jitter),
                 ..PlaybackSettings::DESPAWN
             },
         ));
+    }
+}
+
+/// Tyre screech while the player's car slides, splashing while it drives
+/// through water.
+fn car_loops(
+    time: Res<Time>,
+    game: Res<State<GameState>>,
+    terrain: Res<Terrain>,
+    player: Query<(&Transform, &Car), With<Player>>,
+    mut loops: Query<(&CarLoop, &mut AudioSink)>,
+    mut levels: Local<[f32; 2]>,
+) {
+    let k = 1.0 - (-12.0 * time.delta_secs()).exp();
+    let driving = player
+        .single()
+        .ok()
+        .filter(|(_, car)| car.alive() && !car.airborne && *game.get() == GameState::Playing);
+    let (screech, splash) = match driving {
+        Some((tf, car)) => {
+            let slide = car.vel.dot(car.forward().perp()).abs();
+            let speed = car.vel.length();
+            let wet = terrain.water_depth(tf.translation.truncate()) > 0.0;
+            // Only real slides screech; ordinary cornering stays quiet.
+            let grip = if wet { 0.0 } else { ((slide - 140.0) / 300.0).clamp(0.0, 1.0) };
+            let hand = if car.handbrake && !wet && speed > 120.0 { 0.4 } else { 0.0 };
+            (grip.max(hand), if wet { (speed / 400.0).min(1.0) } else { 0.0 })
+        }
+        None => (0.0, 0.0),
+    };
+    levels[0] += (screech - levels[0]) * k;
+    levels[1] += (splash - levels[1]) * k;
+    for (kind, mut sink) in &mut loops {
+        let (level, gain) = match kind {
+            CarLoop::Screech => (levels[0], 0.2),
+            CarLoop::Splash => (levels[1], 0.45),
+        };
+        sink.set_volume(Volume::Linear(level * gain * MASTER_VOLUME));
+        if *kind == CarLoop::Screech {
+            // A little higher the harder the slide.
+            sink.set_speed(0.95 + 0.1 * level);
+        }
     }
 }
 
@@ -250,15 +338,15 @@ fn engine_sound(
 // ---------------------------------------------------------------------------
 
 /// Render `secs` of audio by calling `f(t)` for every sample.
-fn render(secs: f32, mut f: impl FnMut(f32) -> f32) -> Vec<f32> {
+pub(crate) fn render(secs: f32, mut f: impl FnMut(f32) -> f32) -> Vec<f32> {
     let n = (secs * RATE as f32) as usize;
     (0..n).map(|i| f(i as f32 / RATE as f32)).collect()
 }
 
-struct Noise(u32);
+pub(crate) struct Noise(pub(crate) u32);
 
 impl Noise {
-    fn white(&mut self) -> f32 {
+    pub(crate) fn white(&mut self) -> f32 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 17;
         self.0 ^= self.0 << 5;
@@ -267,49 +355,58 @@ impl Noise {
 }
 
 /// One-pole low-pass filter; `a` in 0..1, smaller = darker.
-struct LowPass(f32);
+pub(crate) struct LowPass(pub(crate) f32);
 
 impl LowPass {
-    fn step(&mut self, x: f32, a: f32) -> f32 {
+    pub(crate) fn step(&mut self, x: f32, a: f32) -> f32 {
         self.0 += a * (x - self.0);
         self.0
     }
 }
 
 /// Oscillator that integrates frequency, so sweeps don't glitch.
-struct Osc(f32);
+pub(crate) struct Osc(pub(crate) f32);
 
 impl Osc {
-    fn step(&mut self, freq: f32) -> f32 {
+    pub(crate) fn step(&mut self, freq: f32) -> f32 {
         self.0 = (self.0 + freq / RATE as f32).fract();
         self.0
     }
 }
 
-fn sine(phase: f32) -> f32 {
+pub(crate) fn sine(phase: f32) -> f32 {
     (phase * TAU).sin()
 }
-fn saw(phase: f32) -> f32 {
+pub(crate) fn saw(phase: f32) -> f32 {
     phase * 2.0 - 1.0
 }
-fn square(phase: f32) -> f32 {
+pub(crate) fn square(phase: f32) -> f32 {
     if phase < 0.5 { 1.0 } else { -1.0 }
 }
 /// Fast attack, exponential decay.
-fn env(t: f32, attack: f32, decay: f32) -> f32 {
+pub(crate) fn env(t: f32, attack: f32, decay: f32) -> f32 {
     (t / attack).min(1.0) * (-t * decay).exp()
 }
 
-fn crash(secs: f32) -> Vec<f32> {
-    let mut n = Noise(0x1234_5678);
+/// A collision: a low thud, a crunch of noise, and the ring of bent metal.
+/// `variant` changes the metal's pitches and the noise, so repeats differ.
+fn crash(secs: f32, variant: u32) -> Vec<f32> {
+    let mut n = Noise(0x1234_5678 ^ variant.wrapping_mul(0x9E37_79B9));
     let mut lp = LowPass(0.0);
+    let mut crunch_lp = LowPass(0.0);
+    let mut thud = Osc(0.0);
+    let shift = 1.0 + 0.11 * variant as f32;
+    // Inharmonic partials sound like bent metal.
+    let partials = [(310.0 * shift, 1.0, 13.0), (527.0 * shift, 0.8, 11.0), (811.0 * shift, 0.6, 15.0), (1270.0 * shift, 0.35, 20.0)];
     render(secs, |t| {
-        let body = lp.step(n.white(), 0.3) * env(t, 0.002, 11.0);
-        // Inharmonic partials sound like bent metal.
-        let ring = (sine(t * 310.0 % 1.0) + sine(t * 527.0 % 1.0) * 0.8 + sine(t * 811.0 % 1.0) * 0.6)
-            * env(t, 0.002, 13.0);
-        let thump = sine(t * 62.0 % 1.0) * env(t, 0.003, 16.0);
-        body * 1.2 + ring * 0.25 + thump * 0.9
+        let white = n.white();
+        let body = lp.step(white, 0.3) * env(t, 0.002, 11.0);
+        // Gritty crunch: noise chopped into little bursts, like parts giving way.
+        let chop = if (t * 90.0 + variant as f32).fract() < 0.35 { 1.0 } else { 0.25 };
+        let crunch = crunch_lp.step(white, 0.55) * chop * env(t, 0.004, 9.0);
+        let ring: f32 = partials.iter().map(|&(f, a, d)| sine((t * f) % 1.0) * a * env(t, 0.002, d)).sum();
+        let low = sine(thud.step(70.0 - 25.0 * (t * 8.0).min(1.0))) * env(t, 0.003, 14.0);
+        ((body * 1.1 + crunch * 0.6 + ring * 0.22 + low * 1.1) * 1.3).tanh()
     })
 }
 
@@ -356,19 +453,118 @@ fn mine_drop() -> Vec<f32> {
     })
 }
 
-fn explosion(secs: f32) -> Vec<f32> {
-    let mut n = Noise(0xB00B_1E55);
+/// A blast: a sharp crack, a deep falling boom, a long rumble, and debris
+/// pattering down afterwards.
+fn explosion(secs: f32, variant: u32) -> Vec<f32> {
+    let mut n = Noise(0xB00B_1E55 ^ variant.wrapping_mul(0x85EB_CA6B));
     let mut lp1 = LowPass(0.0);
     let mut lp2 = LowPass(0.0);
     let mut osc = Osc(0.0);
+    let mut sub = Osc(0.0);
+    let mut debris = Noise(0x00DE_B215 + variant);
+    let mut debris_lp = LowPass(0.0);
     render(secs, |t| {
         let white = n.white();
         // Double-filtered noise gives a deep rumble.
-        let rumble = lp2.step(lp1.step(white, 0.08), 0.12) * 4.0 * env(t, 0.004, 3.0);
-        let crack = white * env(t, 0.0005, 35.0) * 0.5;
-        let thump = sine(osc.step(75.0 - 40.0 * (t * 3.0).min(1.0))) * env(t, 0.003, 5.0);
-        ((rumble + crack + thump) * 1.6).tanh()
+        let rumble = lp2.step(lp1.step(white, 0.08), 0.12) * 4.0 * env(t, 0.004, 2.6);
+        let crack = white * env(t, 0.0005, 35.0) * 0.6;
+        let thump = sine(osc.step(80.0 - 45.0 * (t * 3.0).min(1.0))) * env(t, 0.003, 4.5);
+        let boom = sine(sub.step(42.0 - 14.0 * (t * 2.0).min(1.0))) * env(t, 0.01, 2.2) * 0.8;
+        // Debris: sparse little clicks, thinning out.
+        let d = debris.white();
+        let click = if d > 0.985 - 0.02 * (-t * 2.0).exp() { 1.0 } else { 0.0 };
+        let patter = debris_lp.step(click, 0.5) * 2.0 * ((t - 0.25).max(0.0) * 6.0).min(1.0) * (-t * 2.0).exp();
+        ((rumble + crack + thump + boom + patter) * 1.5).tanh()
     })
+}
+
+/// Landing a jump: a heavy suspension thump with a rattle.
+fn land() -> Vec<f32> {
+    let mut n = Noise(0x1A2D_0001);
+    let mut lp = LowPass(0.0);
+    let mut osc = Osc(0.0);
+    render(0.35, |t| {
+        let thump = sine(osc.step(95.0 - 50.0 * (t * 10.0).min(1.0))) * env(t, 0.002, 14.0);
+        let rattle = lp.step(n.white(), 0.35) * env(t, 0.003, 20.0) * (1.0 + 0.5 * sine((t * 37.0) % 1.0));
+        ((thump * 1.3 + rattle * 0.6) * 1.2).tanh()
+    })
+}
+
+/// A boost pad: a punchy kick and a rising whoosh of air.
+fn boost() -> Vec<f32> {
+    let mut n = Noise(0xB005_7000);
+    let mut lp = LowPass(0.0);
+    let mut osc = Osc(0.0);
+    let mut kick = Osc(0.0);
+    let dur = 0.7;
+    render(dur, |t| {
+        let k = t / dur;
+        let air = lp.step(n.white(), 0.08 + 0.5 * k) * (PI * k).sin() * 1.3;
+        let whine = sine(osc.step(300.0 + 900.0 * k)) * 0.25 * (PI * k).sin();
+        let punch = sine(kick.step(110.0 - 60.0 * (t * 12.0).min(1.0))) * env(t, 0.002, 18.0);
+        air + whine + punch
+    })
+}
+
+/// Seamless tyre screech. Real screech is mostly noise ringing through a few
+/// rough resonances of the tyre, fluttering as the rubber grips and slips,
+/// over a low scrub, so that's what this is (a clean tone just whistles).
+/// The noise repeats exactly every loop, so it loops cleanly.
+fn screech_loop() -> Vec<f32> {
+    let len = RATE as usize; // one second
+    let noise = |i: usize, salt: u32| hash01((i % len) as u32 * 7 + salt) * 2.0 - 1.0;
+    let mut squeal = [
+        Resonator::new(850.0, 110.0, 1.0),
+        Resonator::new(1320.0, 330.0, 0.7),
+        Resonator::new(2100.0, 480.0, 0.35),
+    ];
+    let (mut scrub, mut flutter_a, mut flutter_b) = (LowPass(0.0), LowPass(0.0), LowPass(0.0));
+    let (mut ring, mut low, mut flutter) = (Vec::with_capacity(len), Vec::with_capacity(len), Vec::with_capacity(len));
+    // Render twice and keep the second pass, so filter state wraps round.
+    for pass in 0..2 {
+        for i in 0..len {
+            let white = noise(i, 1);
+            // Stick-slip flutter: smoothed noise at two speeds, multiplied.
+            let fa = flutter_a.step(noise(i, 2), 0.0015) * 45.0;
+            let fb = flutter_b.step(noise(i, 3), 0.006) * 14.0;
+            let f = (0.5 + fa).clamp(0.05, 1.4) * (0.7 + fb).clamp(0.2, 1.2);
+            let r: f32 = squeal.iter_mut().map(|r| r.step(white)).sum();
+            let l = scrub.step(white, 0.05);
+            if pass == 1 {
+                ring.push(r);
+                low.push(l);
+                flutter.push(f);
+            }
+        }
+    }
+    // The layers come out at very different levels; set each one's loudness
+    // before mixing, so the squeal leads and the scrub sits underneath.
+    let rms = |v: &[f32]| (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt().max(1e-9);
+    let (ring_gain, low_gain) = (0.35 / rms(&ring), 0.12 / rms(&low));
+    (0..len).map(|i| ring[i] * ring_gain * flutter[i] + low[i] * low_gain).collect()
+}
+
+/// Seamless splashing: bubbly filtered noise with irregular surges.
+fn splash_loop() -> Vec<f32> {
+    let len = RATE as usize;
+    // Render twice and keep the second pass, so filter state wraps round.
+    let mut lp = LowPass(0.0);
+    let mut hp = LowPass(0.0);
+    let mut out = Vec::with_capacity(len);
+    for pass in 0..2 {
+        for i in 0..len {
+            let t = i as f32 / RATE as f32;
+            let white = hash01(i as u32 + 9_000_000) * 2.0 - 1.0;
+            let surge = 0.55 + 0.45 * (0.5 + 0.5 * sine((t * 5.0) % 1.0)) * (0.5 + 0.5 * sine((t * 3.0 + 0.3) % 1.0));
+            let body = lp.step(white, 0.25);
+            let fizz = white - hp.step(white, 0.2);
+            let s = (body * 1.2 + fizz * 0.3) * surge;
+            if pass == 1 {
+                out.push(s);
+            }
+        }
+    }
+    out
 }
 
 fn health() -> Vec<f32> {
@@ -411,8 +607,8 @@ fn turbo() -> Vec<f32> {
 }
 
 fn wreck() -> Vec<f32> {
-    let boom = explosion(1.2);
-    let bang = crash(0.6);
+    let boom = explosion(1.4, 7);
+    let bang = crash(0.6, 9);
     boom.iter()
         .enumerate()
         .map(|(i, b)| b * 0.75 + bang.get(i).copied().unwrap_or(0.0) * 0.6)
@@ -540,7 +736,7 @@ fn engine_loop(firing_hz: f32) -> Vec<f32> {
     out
 }
 
-fn normalize(mut samples: Vec<f32>) -> Vec<f32> {
+pub(crate) fn normalize(mut samples: Vec<f32>) -> Vec<f32> {
     let peak = samples.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
     if peak > 0.0 {
         for s in &mut samples {
@@ -551,7 +747,7 @@ fn normalize(mut samples: Vec<f32>) -> Vec<f32> {
 }
 
 /// Encode mono f32 samples as a 16-bit PCM WAV file.
-fn to_wav(samples: &[f32]) -> Vec<u8> {
+pub(crate) fn to_wav(samples: &[f32]) -> Vec<u8> {
     let data_len = (samples.len() * 2) as u32;
     let mut out = Vec::with_capacity(44 + data_len as usize);
     out.extend_from_slice(b"RIFF");
@@ -616,6 +812,19 @@ mod tests {
         for hz in ENGINE_LAYERS {
             let looped: Vec<f32> = normalize(engine_loop(hz)).repeat(3);
             std::fs::write(format!("{dir}/engine_{hz}hz_x3.wav"), to_wav(&looped)).unwrap();
+        }
+        let sounds: Vec<(&str, Vec<f32>)> = vec![
+            ("crash_0", crash(0.45, 0)),
+            ("crash_3", crash(0.69, 3)),
+            ("explosion", explosion(1.6, 0)),
+            ("wreck", wreck()),
+            ("land", land()),
+            ("boost", boost()),
+            ("screech_x3", screech_loop().repeat(3)),
+            ("splash_x3", splash_loop().repeat(3)),
+        ];
+        for (name, samples) in sounds {
+            std::fs::write(format!("{dir}/{name}.wav"), to_wav(&normalize(samples))).unwrap();
         }
     }
 }
