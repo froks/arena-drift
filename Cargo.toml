@@ -8,7 +8,9 @@ rust-version = "1.88"
 bevy = { version = "0.20.1", default-features = false, features = [
     # Trimmed down so no gamepad/wayland dev packages are needed (audio needs libasound2-dev).
     "default_app", "std", "multi_threaded", "bevy_winit", "x11", "default_font",
-    "2d_bevy_render", "ui_api", "ui_bevy_render", "bevy_state",
+    # 3D rendering: lit meshes and shadows (no glTF, no tonemapping LUTs).
+    "common_api", "bevy_render", "bevy_core_pipeline", "bevy_pbr", "bevy_light", "bevy_gizmos_render",
+    "ui_api", "ui_bevy_render", "bevy_state",
     "bevy_audio", "wav",
 ] }
 

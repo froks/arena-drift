@@ -451,7 +451,7 @@ pub fn lineup_paints(lineup: &[usize]) -> Vec<Color> {
 /// (those get darkened as the car takes damage).
 #[derive(Clone)]
 enum Slot {
-    Fixed(Handle<ColorMaterial>),
+    Fixed(Handle<StandardMaterial>),
     Paint,
     PaintDark,
     Accent,
@@ -473,35 +473,70 @@ pub struct CarArt {
 
 /// A car's own paint materials and their original colours.
 pub struct Paint {
-    pub handles: [Handle<ColorMaterial>; 3],
+    pub handles: [Handle<StandardMaterial>; 3],
     pub colors: [Color; 3],
 }
 
 #[derive(Component)]
 pub struct FrontWheel;
 
+/// Height of a model's roof above the ground (for health bars and the like).
+pub fn roof_height(model: &CarModel) -> f32 {
+    let p = Proportions::of(model);
+    p.body_top + p.cabin_h
+}
+
+/// Vertical layout of a model, in world units.
+struct Proportions {
+    wheel_r: f32,
+    clearance: f32,
+    body_h: f32,
+    body_top: f32,
+    cabin_h: f32,
+}
+
+impl Proportions {
+    fn of(model: &CarModel) -> Self {
+        let look = &model.look;
+        let w = model.size.y;
+        let wheel_r = look.wheel.x / 2.0;
+        let clearance = wheel_r * 0.5;
+        let body_h = w * if look.cargo_bed { 0.38 } else { 0.32 };
+        Self { wheel_r, clearance, body_h, body_top: clearance + body_h, cabin_h: w * 0.27 }
+    }
+}
+
 // Built when the app is created (not in a Startup system), because the first
 // state's OnEnter systems run before Startup and already need it.
 impl FromWorld for CarArt {
     fn from_world(world: &mut World) -> Self {
         world.resource_scope(|world, mut meshes: Mut<Assets<Mesh>>| {
-            let mut materials = world.resource_mut::<Assets<ColorMaterial>>();
+            let mut materials = world.resource_mut::<Assets<StandardMaterial>>();
             build_car_art(&mut meshes, &mut materials)
         })
     }
 }
 
-fn build_car_art(meshes: &mut Assets<Mesh>, materials: &mut Assets<ColorMaterial>) -> CarArt {
-    let square = meshes.add(Rectangle::new(1.0, 1.0));
-    let mut fixed = |c: Color| Slot::Fixed(materials.add(c));
-    let shadow = fixed(Color::srgba(0.0, 0.0, 0.0, 0.35));
-    let tyre = fixed(Color::srgb(0.07, 0.07, 0.08));
-    let glass = fixed(Color::srgb(0.55, 0.75, 0.9));
-    let glass_dark = fixed(Color::srgb(0.22, 0.3, 0.4));
-    let headlight = fixed(Color::srgb(1.0, 0.95, 0.7));
-    let taillight = fixed(Color::srgb(0.9, 0.1, 0.1));
-    let steel = fixed(Color::srgb(0.55, 0.57, 0.6));
-    let trim = fixed(Color::srgb(0.12, 0.12, 0.13));
+fn build_car_art(meshes: &mut Assets<Mesh>, materials: &mut Assets<StandardMaterial>) -> CarArt {
+    let cube = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
+    // Cylinders run along Y, which is the axle direction for a car.
+    let wheel = meshes.add(Cylinder::new(1.0, 1.0));
+    let mut fixed = |c: Color, roughness: f32, unlit: bool| {
+        Slot::Fixed(materials.add(StandardMaterial {
+            base_color: c,
+            perceptual_roughness: roughness,
+            unlit,
+            ..default()
+        }))
+    };
+    let tyre = fixed(Color::srgb(0.07, 0.07, 0.08), 0.95, false);
+    let hub = fixed(Color::srgb(0.5, 0.5, 0.52), 0.5, false);
+    let glass = fixed(Color::srgb(0.45, 0.62, 0.78), 0.15, false);
+    let glass_dark = fixed(Color::srgb(0.16, 0.22, 0.3), 0.15, false);
+    let headlight = fixed(Color::srgb(1.0, 0.95, 0.7), 1.0, true);
+    let taillight = fixed(Color::srgb(0.9, 0.1, 0.1), 1.0, true);
+    let steel = fixed(Color::srgb(0.55, 0.57, 0.6), 0.4, false);
+    let trim = fixed(Color::srgb(0.12, 0.12, 0.13), 0.7, false);
 
     let parts = MODELS
         .iter()
@@ -509,84 +544,114 @@ fn build_car_art(meshes: &mut Assets<Mesh>, materials: &mut Assets<ColorMaterial
             let look = &model.look;
             let hl = model.size / 2.0;
             let w = model.size.y;
-            let body = meshes.add(body_polygon(model));
-            let rect = |slot: &Slot, x: f32, y: f32, z: f32, len: f32, width: f32| Part {
-                mesh: square.clone(),
+            let pr = Proportions::of(model);
+            let top = pr.body_top;
+            let body = meshes.add(Extrusion::new(body_polygon(model), pr.body_h));
+            let part = |mesh: &Handle<Mesh>, slot: &Slot, transform: Transform| Part {
+                mesh: mesh.clone(),
                 slot: slot.clone(),
-                transform: Transform::from_xyz(x, y, z).with_scale(Vec3::new(len, width, 1.0)),
+                transform,
                 front_wheel: false,
+            };
+            // A box whose bottom sits at `base`.
+            let block = |slot: &Slot, x: f32, y: f32, base: f32, size: Vec3| {
+                part(&cube, slot, Transform::from_xyz(x, y, base + size.z / 2.0).with_scale(size))
+            };
+            // A thin pane from `from` to `to` (in the car's XZ plane), `width` across.
+            let pane = |slot: &Slot, from: Vec2, to: Vec2, width: f32| {
+                let (a, b) = (Vec3::new(from.x, 0.0, from.y), Vec3::new(to.x, 0.0, to.y));
+                let dir = (b - a).normalize();
+                part(
+                    &cube,
+                    slot,
+                    Transform::from_translation((a + b) / 2.0)
+                        .with_rotation(Quat::from_rotation_arc(Vec3::X, dir))
+                        .with_scale(Vec3::new(a.distance(b), width, 1.2)),
+                )
             };
             let mut p = Vec::new();
 
-            p.push(Part {
-                mesh: body.clone(),
-                slot: shadow.clone(),
-                transform: Transform::from_xyz(0.0, 0.0, -0.4).with_scale(Vec3::splat(1.12)),
-                front_wheel: false,
-            });
-
-            // Tyres poke out from under the body.
+            // Wheels poke out from under the body.
             for (i, &ax) in look.axles.iter().enumerate() {
                 for side in [-1.0, 1.0] {
-                    let mut tyre = rect(&tyre, ax * hl.x, side * (hl.y - look.wheel.y * 0.2), -0.2, look.wheel.x, look.wheel.y);
-                    tyre.front_wheel = i == 0;
-                    p.push(tyre);
+                    let at = Vec3::new(ax * hl.x, side * (hl.y - look.wheel.y * 0.2), pr.wheel_r);
+                    let mut t = part(&wheel, &tyre, Transform::from_translation(at).with_scale(Vec3::new(pr.wheel_r, look.wheel.y, pr.wheel_r)));
+                    t.front_wheel = i == 0;
+                    p.push(t);
+                    let cap = at + Vec3::Y * side * look.wheel.y * 0.5;
+                    p.push(part(&wheel, &hub, Transform::from_translation(cap).with_scale(Vec3::new(pr.wheel_r * 0.5, 0.6, pr.wheel_r * 0.5))));
                 }
             }
 
-            p.push(Part { mesh: body, slot: Slot::Paint, transform: Transform::default(), front_wheel: false });
+            p.push(part(&body, &Slot::Paint, Transform::from_xyz(0.0, 0.0, pr.clearance + pr.body_h / 2.0)));
 
             if look.cargo_bed {
+                // An open bed: dark floor with ribs and a rim round the edge.
                 let (back, front) = (-0.93 * hl.x, 0.12 * hl.x);
-                p.push(rect(&Slot::PaintDark, (back + front) / 2.0, 0.0, 0.05, front - back, w * 0.8));
+                let len = front - back;
+                let cx = (back + front) / 2.0;
+                p.push(block(&Slot::PaintDark, cx, 0.0, top, Vec3::new(len, w * 0.8, 0.4)));
                 for k in 0..4 {
-                    let x = back + (front - back) * (k as f32 + 0.5) / 4.0;
-                    p.push(rect(&trim, x, 0.0, 0.06, 1.5, w * 0.74));
+                    let x = back + len * (k as f32 + 0.5) / 4.0;
+                    p.push(block(&trim, x, 0.0, top, Vec3::new(1.5, w * 0.74, 0.8)));
                 }
+                for side in [-1.0, 1.0] {
+                    p.push(block(&Slot::Paint, cx, side * w * 0.42, top, Vec3::new(len, w * 0.06, 3.0)));
+                }
+                p.push(block(&Slot::Paint, back + 1.0, 0.0, top, Vec3::new(2.0, w * 0.84, 3.0)));
             }
 
-            match look.stripes {
-                Stripes::None => {}
-                Stripes::Center => p.push(rect(&Slot::Accent, 0.0, 0.0, 0.06, model.size.x * 0.95, w * 0.2)),
-                Stripes::Twin => {
-                    for side in [-1.0, 1.0] {
-                        p.push(rect(&Slot::Accent, 0.0, side * w * 0.12, 0.06, model.size.x * 0.95, w * 0.08));
-                    }
-                }
-                Stripes::Side => {
-                    for side in [-1.0, 1.0] {
-                        p.push(rect(&Slot::Accent, -0.1 * hl.x, side * w * 0.36, 0.06, model.size.x * 0.75, w * 0.07));
-                    }
-                }
+            // Stripes run over the bonnet, roof and boot.
+            let roof_top = top + pr.cabin_h;
+            let stripes: Vec<(f32, f32, f32, f32)> = match look.stripes {
+                Stripes::None => vec![],
+                Stripes::Center => vec![(0.0, 0.0, model.size.x * 0.95, w * 0.2)],
+                Stripes::Twin => [-1.0, 1.0].map(|s| (0.0, s * w * 0.12, model.size.x * 0.95, w * 0.08)).to_vec(),
+                Stripes::Side => [-1.0, 1.0].map(|s| (-0.1 * hl.x, s * w * 0.36, model.size.x * 0.75, w * 0.07)).to_vec(),
+            };
+            for &(x, y, len, width) in &stripes {
+                p.push(block(&Slot::Accent, x, y, top, Vec3::new(len, width, 0.5)));
             }
 
-            // Roof with windscreen ahead and rear window behind.
+            // Cabin: tinted glass all round under a painted roof, with a
+            // sloping windscreen in front and rear window behind.
             let (cx, chl, chw) = look.cabin;
             let (roof_x, roof_len, roof_w) = (cx * hl.x, 2.0 * chl * hl.x, 2.0 * chw * hl.y);
-            p.push(rect(&Slot::PaintDark, roof_x, 0.0, 0.1, roof_len, roof_w));
-            let ws = 0.2 * hl.x;
-            p.push(rect(&glass, roof_x + roof_len / 2.0 + ws / 2.0, 0.0, 0.12, ws, roof_w * 0.9));
+            p.push(block(&glass_dark, roof_x, 0.0, top, Vec3::new(roof_len, roof_w, pr.cabin_h - 1.0)));
+            p.push(block(&Slot::PaintDark, roof_x, 0.0, roof_top - 1.6, Vec3::new(roof_len * 0.92, roof_w * 0.94, 1.6)));
+            if look.stripes == Stripes::Center || look.stripes == Stripes::Twin {
+                for &(_, y, _, width) in &stripes {
+                    p.push(block(&Slot::Accent, roof_x, y, roof_top - 0.1, Vec3::new(roof_len * 0.92, width, 0.3)));
+                }
+            }
+            let front = roof_x + roof_len / 2.0;
+            let ws = 0.2 * hl.x + pr.cabin_h * 0.4;
+            p.push(pane(&glass, Vec2::new(front, roof_top - 0.6), Vec2::new(front + ws, top + 0.2), roof_w * 0.9));
             if !look.cargo_bed {
-                let rw = 0.12 * hl.x;
-                p.push(rect(&glass_dark, roof_x - roof_len / 2.0 - rw / 2.0, 0.0, 0.12, rw, roof_w * 0.8));
+                let back = roof_x - roof_len / 2.0;
+                let rw = 0.12 * hl.x + pr.cabin_h * 0.3;
+                p.push(pane(&glass_dark, Vec2::new(back, roof_top - 0.6), Vec2::new(back - rw, top + 0.2), roof_w * 0.8));
             }
 
-            // Lights sit inside the nose and tail outline.
+            // Lights sit in the nose and tail.
             let nose_half = look.outline[0].1 * hl.y;
             let tail_half = look.outline[look.outline.len() - 1].1 * hl.y;
             let light_w = (nose_half * 0.45).min(6.0);
             for side in [-1.0, 1.0] {
-                p.push(rect(&headlight, hl.x - 1.5, side * nose_half * 0.55, 0.08, 3.0, light_w));
-                p.push(rect(&taillight, -hl.x + 1.5, side * tail_half * 0.65, 0.08, 3.0, tail_half * 0.4));
+                p.push(block(&headlight, hl.x - 1.4, side * nose_half * 0.55, top - 4.0, Vec3::new(3.0, light_w, 4.3)));
+                p.push(block(&taillight, -hl.x + 1.4, side * tail_half * 0.65, top - 4.0, Vec3::new(3.0, tail_half * 0.4, 4.3)));
             }
 
             if look.spoiler {
-                p.push(rect(&trim, -hl.x + 3.0, 0.0, 0.15, 4.0, w * 0.98));
+                for side in [-1.0, 1.0] {
+                    p.push(block(&trim, -hl.x + 3.0, side * w * 0.32, top, Vec3::new(2.0, 1.5, 5.0)));
+                }
+                p.push(block(&trim, -hl.x + 3.0, 0.0, top + 5.0, Vec3::new(5.0, w * 0.98, 1.2)));
             }
             if look.ram_plate {
-                p.push(rect(&steel, hl.x + 2.0, 0.0, 0.07, 5.0, w * 1.08));
+                p.push(block(&steel, hl.x + 2.0, 0.0, pr.clearance * 0.5, Vec3::new(5.0, w * 1.08, pr.body_h * 0.95)));
                 for side in [-1.0, 0.0, 1.0] {
-                    p.push(rect(&trim, hl.x + 2.0, side * w * 0.35, 0.08, 2.0, 2.0));
+                    p.push(block(&trim, hl.x + 4.6, side * w * 0.35, pr.clearance + pr.body_h * 0.3, Vec3::new(1.0, 2.0, 2.0)));
                 }
             }
             p
@@ -604,12 +669,16 @@ fn body_polygon(model: &CarModel) -> ConvexPolygon {
         .unwrap_or_else(|e| panic!("{}: body outline is not convex: {e:?}", model.name))
 }
 
+fn paint_material(color: Color) -> StandardMaterial {
+    StandardMaterial { base_color: color, perceptual_roughness: 0.4, reflectance: 0.45, ..default() }
+}
+
 /// Make a fresh set of paint materials for one car.
-pub fn new_paint(materials: &mut Assets<ColorMaterial>, model: &CarModel, paint: Color) -> Paint {
+pub fn new_paint(materials: &mut Assets<StandardMaterial>, model: &CarModel, paint: Color) -> Paint {
     let dark = paint.mix(&Color::BLACK, 0.35);
     let accent = model.look.accent;
     Paint {
-        handles: [materials.add(paint), materials.add(dark), materials.add(accent)],
+        handles: [paint, dark, accent].map(|c| materials.add(paint_material(c))),
         colors: [paint, dark, accent],
     }
 }
@@ -624,7 +693,7 @@ pub fn attach_car_visual(commands: &mut Commands, art: &CarArt, model_index: usi
                 Slot::PaintDark => paint.handles[1].clone(),
                 Slot::Accent => paint.handles[2].clone(),
             };
-            let mut child = parent.spawn((Mesh2d(part.mesh.clone()), MeshMaterial2d(material), part.transform));
+            let mut child = parent.spawn((Mesh3d(part.mesh.clone()), MeshMaterial3d(material), part.transform));
             if part.front_wheel {
                 child.insert(FrontWheel);
             }

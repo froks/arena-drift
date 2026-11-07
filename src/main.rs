@@ -12,6 +12,7 @@ mod icons;
 mod minimap;
 mod physics;
 mod sound;
+mod terrain;
 
 use std::collections::VecDeque;
 
@@ -23,6 +24,7 @@ use cars::{CarArt, CarModel, MODELS, Paint};
 use icons::IconArt;
 use physics::{Obb, cross};
 use sound::{Sfx, SoundPlugin, Sounds};
+use terrain::Terrain;
 
 // ---------------------------------------------------------------------------
 // Tuning
@@ -36,6 +38,7 @@ const MAX_SKIDS: usize = 1600;
 // Shared by all models; per-model handling lives in `cars::MODELS`.
 const BRAKE_FORCE: f32 = 900.0;
 const REVERSE_FORCE: f32 = 300.0;
+const ENGINE_BRAKE: f32 = 140.0;
 const HANDBRAKE_GRIP: f32 = 1.2;
 const WRECK_DRAG: f32 = 2.5;
 const WRECK_MASS: f32 = 2.5; // wrecks are heavier, so they act like obstacles
@@ -81,6 +84,10 @@ const MINE_DAMAGE: f32 = 45.0;
 const MINE_BLAST: f32 = 100.0;
 
 const BLAST_KNOCKBACK: f32 = 600.0;
+/// How high above the ground bullets and rockets fly.
+const SHOT_HEIGHT: f32 = 10.0;
+/// How high above the ground power-ups hover.
+const PICKUP_HOVER: f32 = 14.0;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -247,6 +254,10 @@ impl PickupKind {
 #[derive(Component)]
 struct Pickup(PickupKind);
 
+/// Height a power-up bobs around.
+#[derive(Component)]
+struct Hover(f32);
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ProjectileKind {
     Bullet,
@@ -369,16 +380,16 @@ struct PendingBlasts(Vec<Blast>);
 #[derive(Resource)]
 struct Art {
     spark_mesh: Handle<Mesh>,
-    spark_mat: Handle<ColorMaterial>,
-    exhaust_mat: Handle<ColorMaterial>,
+    spark_mat: Handle<StandardMaterial>,
+    exhaust_mat: Handle<StandardMaterial>,
     bullet_mesh: Handle<Mesh>,
-    bullet_mat: Handle<ColorMaterial>,
+    bullet_mat: Handle<StandardMaterial>,
     blast_mesh: Handle<Mesh>,
-    blast_mat: Handle<ColorMaterial>,
+    blast_mat: Handle<StandardMaterial>,
     smoke_mesh: Handle<Mesh>,
-    smoke_mat: Handle<ColorMaterial>,
+    smoke_mat: Handle<StandardMaterial>,
     square: Handle<Mesh>,
-    skid_mat: Handle<ColorMaterial>,
+    skid_mat: Handle<StandardMaterial>,
 }
 
 /// Tiny xorshift RNG so we don't need an extra crate.
@@ -448,6 +459,10 @@ fn main() {
         .init_resource::<PickupTimer>()
         .init_resource::<PendingBlasts>()
         .init_resource::<SelectedCar>()
+        .init_resource::<Terrain>()
+        .insert_resource(bevy::light::DirectionalLightShadowMap {
+            size: if cfg!(target_arch = "wasm32") { 2048 } else { 4096 },
+        })
         // Dev shortcut: ARENA_DRIFT_AUTOSTART=1 skips the garage.
         .insert_state(if autostart { GameState::Playing } else { GameState::Garage })
         .init_resource::<CarArt>()
@@ -467,6 +482,7 @@ fn main() {
                     car_physics,
                     static_collisions,
                     car_collisions,
+                    follow_terrain,
                     skid_marks,
                 )
                     .chain(),
@@ -496,8 +512,9 @@ fn main() {
                 spin_pickups,
                 icons::pulse_pickup_glow,
                 cars::steer_front_wheels,
+                arena::fade_canopies,
                 draw_health_bars,
-                camera_follow.after(car_collisions),
+                camera_follow.after(follow_terrain),
             ),
         )
         .add_systems(OnEnter(GameState::GameOver), show_game_over)
@@ -529,32 +546,85 @@ fn dev_screenshot(mut commands: Commands, time: Res<Time<Real>>, mut done: Local
     }
 }
 
+/// Vertical field of view. Wider means more parallax on tall things.
+const CAMERA_FOV: f32 = 0.7;
+
+/// Camera height that shows `visible` world units from top to bottom of the
+/// screen at ground level.
+fn camera_height(visible: f32) -> f32 {
+    visible / 2.0 / (CAMERA_FOV / 2.0).tan()
+}
+
 fn setup_world(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<ColorMaterial>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    commands.spawn((Camera2d, Transform::from_xyz(0.0, 24.0, 0.0)));
+    // Straight down at the ground (Z is up, +Y is up the screen). The
+    // perspective makes tall things lean out from the middle of the screen.
+    commands.spawn((
+        Camera3d::default(),
+        Projection::Perspective(PerspectiveProjection { fov: CAMERA_FOV, near: 20.0, far: 20_000.0, ..default() }),
+        bevy::core_pipeline::tonemapping::Tonemapping::None,
+        bevy::core_pipeline::tonemapping::DebandDither::Disabled,
+        Transform::from_xyz(0.0, 24.0, camera_height(800.0)).looking_to(Vec3::NEG_Z, Vec3::Y),
+        AmbientLight { color: Color::srgb(0.85, 0.88, 1.0), brightness: 380.0, ..default() },
+    ));
+    // Low afternoon sun from the upper left: shadows fall down and to the right.
+    commands.spawn((
+        DirectionalLight { illuminance: 3400.0, shadow_maps_enabled: true, ..default() },
+        Transform::default().looking_to(Vec3::new(0.6, -0.7, -1.0), Vec3::Z),
+        shadow_cascades(camera_height(800.0)),
+    ));
 
+    let glow = |c: Color| StandardMaterial {
+        base_color: c,
+        unlit: true,
+        alpha_mode: if c.alpha() < 1.0 { AlphaMode::Blend } else { AlphaMode::Opaque },
+        ..default()
+    };
     commands.insert_resource(Art {
-        spark_mesh: meshes.add(Rectangle::new(4.0, 4.0)),
-        spark_mat: materials.add(Color::srgb(1.0, 0.8, 0.3)),
-        exhaust_mat: materials.add(Color::srgb(0.4, 0.8, 1.0)),
-        bullet_mesh: meshes.add(Rectangle::new(9.0, 3.0)),
-        bullet_mat: materials.add(Color::srgb(1.0, 0.95, 0.5)),
-        blast_mesh: meshes.add(Circle::new(1.0)),
-        blast_mat: materials.add(Color::srgba(1.0, 0.55, 0.15, 0.7)),
-        smoke_mesh: meshes.add(Circle::new(1.0)),
-        smoke_mat: materials.add(Color::srgba(0.35, 0.35, 0.37, 0.45)),
+        spark_mesh: meshes.add(Cuboid::new(4.0, 4.0, 4.0)),
+        spark_mat: materials.add(glow(Color::srgb(1.0, 0.8, 0.3))),
+        exhaust_mat: materials.add(glow(Color::srgb(0.4, 0.8, 1.0))),
+        bullet_mesh: meshes.add(Cuboid::new(9.0, 3.0, 3.0)),
+        bullet_mat: materials.add(glow(Color::srgb(1.0, 0.95, 0.5))),
+        blast_mesh: meshes.add(Sphere::new(1.0).mesh().ico(3).expect("valid icosphere")),
+        blast_mat: materials.add(glow(Color::srgba(1.0, 0.55, 0.15, 0.7))),
+        smoke_mesh: meshes.add(Sphere::new(1.0).mesh().ico(2).expect("valid icosphere")),
+        smoke_mat: materials.add(StandardMaterial {
+            base_color: Color::srgba(0.35, 0.35, 0.37, 0.45),
+            alpha_mode: AlphaMode::Blend,
+            perceptual_roughness: 1.0,
+            ..default()
+        }),
         square: meshes.add(Rectangle::new(1.0, 1.0)),
-        skid_mat: materials.add(Color::srgba(0.05, 0.05, 0.05, 0.35)),
+        skid_mat: materials.add(StandardMaterial {
+            depth_bias: 50.0,
+            ..glow(Color::srgba(0.05, 0.05, 0.05, 0.35))
+        }),
     });
+}
+
+/// Shadows only need to reach the ground, which is about `height` below the camera.
+fn shadow_cascades(height: f32) -> bevy::light::CascadeShadowConfig {
+    bevy::light::CascadeShadowConfigBuilder {
+        num_cascades: 1,
+        minimum_distance: 1.0,
+        maximum_distance: height * 1.5 + 400.0,
+        first_cascade_far_bound: height * 1.5 + 400.0,
+        overlap_proportion: 0.2,
+    }
+    .build()
 }
 
 #[allow(clippy::too_many_arguments)]
 fn start_round(
     mut commands: Commands,
-    mut materials: ResMut<Assets<ColorMaterial>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut images: ResMut<Assets<Image>>,
+    mut terrain: ResMut<Terrain>,
     car_art: Res<CarArt>,
     selected: Res<SelectedCar>,
     mut score: ResMut<Score>,
@@ -572,7 +642,9 @@ fn start_round(
     skids.0.clear();
     *score = Score::default();
     let def = current.def();
-    let obstacles = arena::spawn_arena(&mut commands, &mut arena_art, &mut materials, def);
+    let (obstacles, ground) =
+        arena::spawn_arena(&mut commands, &mut arena_art, &mut meshes, &mut images, &mut materials, def);
+    *terrain = ground;
     minimap::spawn_minimap(&mut commands, def.size, RoundEntity);
     // The player's car first, then rivals from the same tier.
     let lineup = match &sim {
@@ -594,8 +666,8 @@ fn start_round(
             .spawn((
                 RoundEntity,
                 Armory::default(),
-                Transform::from_translation(pos.extend(0.0))
-                    .with_rotation(Quat::from_rotation_z(heading)),
+                Transform::from_translation(pos.extend(terrain.height(pos)))
+                    .with_rotation(terrain.resting(pos, model.size / 2.0, heading)),
             ))
             .id();
         cars::attach_car_visual(&mut commands, &car_art, model_index, &paint, root);
@@ -667,25 +739,27 @@ fn garage_slot(model: usize) -> f32 {
 
 fn setup_garage(
     mut commands: Commands,
-    mut materials: ResMut<Assets<ColorMaterial>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
     mut meshes: ResMut<Assets<Mesh>>,
+    mut terrain: ResMut<Terrain>,
     car_art: Res<CarArt>,
     old: Query<Entity, With<RoundEntity>>,
 ) {
     for e in &old {
         commands.entity(e).despawn();
     }
+    *terrain = Terrain::default();
 
-    // Showroom floor.
-    for (size, color, z) in [
-        (Vec2::new(1232.0, 712.0), Color::srgb(0.75, 0.6, 0.15), -11.0),
-        (Vec2::new(1200.0, 680.0), Color::srgb(0.22, 0.19, 0.16), -10.0),
+    // Showroom floor: a gold-trimmed plinth.
+    for (size, color, top) in [
+        (Vec3::new(1232.0, 712.0, 20.0), Color::srgb(0.75, 0.6, 0.15), -1.0),
+        (Vec3::new(1200.0, 680.0, 20.0), Color::srgb(0.22, 0.19, 0.16), 0.0),
     ] {
         commands.spawn((
             DespawnOnExit(GameState::Garage),
-            Mesh2d(meshes.add(Rectangle::from_size(size))),
-            MeshMaterial2d(materials.add(color)),
-            Transform::from_xyz(0.0, 0.0, z),
+            Mesh3d(meshes.add(Cuboid::from_size(size))),
+            MeshMaterial3d(materials.add(arena::surface(color, false))),
+            Transform::from_xyz(0.0, 0.0, top - size.z / 2.0),
         ));
     }
 
@@ -820,8 +894,8 @@ fn garage_animate(
         if car.0 == selected.0 {
             tf.scale = Vec3::splat(2.5);
             tf.rotation = Quat::from_rotation_z(up + (t * 1.5).sin() * 0.25);
-            gizmos.rect_2d(
-                Isometry2d::from_translation(tf.translation.truncate()),
+            gizmos.rect(
+                Isometry3d::from_translation(tf.translation.truncate().extend(1.0)),
                 Vec2::new(GARAGE_SPACING - 40.0, 210.0),
                 Color::srgb(0.95, 0.8, 0.3),
             );
@@ -1005,10 +1079,13 @@ fn ai_drive(
     }
 }
 
-fn car_physics(time: Res<Time>, mut q: Query<(&mut Transform, &mut Car, &mut Armory)>) {
+fn car_physics(time: Res<Time>, terrain: Res<Terrain>, mut q: Query<(&mut Transform, &mut Car, &mut Armory)>) {
     let dt = time.delta_secs();
     for (mut tf, mut car, mut armory) in &mut q {
         let m = car.model;
+        // Slopes pull everything downhill: valleys collect wrecks.
+        let downhill = -terrain.gradient(tf.translation.truncate()) * terrain::GRAVITY;
+        car.vel += downhill * dt;
         let fwd = car.forward();
         let right = fwd.perp();
         let mut v_fwd = car.vel.dot(fwd);
@@ -1025,6 +1102,11 @@ fn car_physics(time: Res<Time>, mut q: Query<(&mut Transform, &mut Car, &mut Arm
                 t => t * REVERSE_FORCE,
             };
             v_fwd += accel * dt;
+            // Off the throttle the engine holds the car back, so it doesn't
+            // roll away down gentle slopes.
+            if car.throttle == 0.0 {
+                v_fwd -= v_fwd.signum() * (ENGINE_BRAKE * dt).min(v_fwd.abs());
+            }
 
             // Steering only works while rolling; flips when reversing.
             let roll = (v_fwd / 180.0).clamp(-1.0, 1.0);
@@ -1042,7 +1124,15 @@ fn car_physics(time: Res<Time>, mut q: Query<(&mut Transform, &mut Car, &mut Arm
         car.heading += car.spin * dt;
 
         tf.translation += (car.vel * dt).extend(0.0);
-        tf.rotation = Quat::from_rotation_z(car.heading);
+    }
+}
+
+/// Sit every car on the ground under it, pitched and rolled with the slope.
+fn follow_terrain(terrain: Res<Terrain>, mut q: Query<(&mut Transform, &Car)>) {
+    for (mut tf, car) in &mut q {
+        let pos = tf.translation.truncate();
+        tf.translation.z = terrain.height(pos);
+        tf.rotation = terrain.resting(pos, car.model.size / 2.0, car.heading);
     }
 }
 
@@ -1113,7 +1203,7 @@ fn static_collisions(
         if impact > DAMAGE_THRESHOLD * 1.5 && car.alive() {
             let dmg = (impact - DAMAGE_THRESHOLD * 1.5) * WALL_DAMAGE_SCALE * factor / car.model.armor;
             car.hp -= dmg;
-            spawn_sparks(&mut commands, &art, &mut rng, point, normal.perp(), impact * factor.min(1.0));
+            spawn_sparks(&mut commands, &art, &mut rng, point.extend(tf.translation.z + 8.0), normal.perp(), impact * factor.min(1.0));
         }
     }
 }
@@ -1123,6 +1213,7 @@ fn skid_marks(
     mut commands: Commands,
     time: Res<Time>,
     art: Res<Art>,
+    terrain: Res<Terrain>,
     mut skids: ResMut<SkidMarks>,
     cars: Query<(&Transform, &Car)>,
 ) {
@@ -1140,13 +1231,14 @@ fn skid_marks(
         let pos = tf.translation.truncate();
         for side in [-1.0, 1.0] {
             let at = pos + fwd * rear + fwd.perp() * side * (hl.y - m.look.wheel.y * 0.2);
+            let ground = Quat::from_rotation_arc(Vec3::Z, terrain.normal(at));
             let mark = commands
                 .spawn((
                     RoundEntity,
-                    Mesh2d(art.square.clone()),
-                    MeshMaterial2d(art.skid_mat.clone()),
-                    Transform::from_translation(at.extend(-9.0))
-                        .with_rotation(Quat::from_rotation_z(car.vel.to_angle()))
+                    Mesh3d(art.square.clone()),
+                    MeshMaterial3d(art.skid_mat.clone()),
+                    Transform::from_translation(at.extend(terrain.height(at) + 0.4))
+                        .with_rotation(ground * Quat::from_rotation_z(car.vel.to_angle()))
                         .with_scale(Vec3::new(speed * dt + 2.0, m.look.wheel.y * 0.8, 1.0)),
                 ))
                 .id();
@@ -1215,7 +1307,8 @@ fn car_collisions(
         hurt(&mut a, dmg_a, b_player, &mut score);
         hurt(&mut b, dmg_b, a_player, &mut score);
 
-        spawn_sparks(&mut commands, &art, &mut rng, contact.point, n.perp(), closing);
+        let z = (ta.translation.z + tb.translation.z) / 2.0 + 8.0;
+        spawn_sparks(&mut commands, &art, &mut rng, contact.point.extend(z), n.perp(), closing);
     }
 }
 
@@ -1228,6 +1321,7 @@ fn fire_weapons(
     mut commands: Commands,
     time: Res<Time>,
     art: Res<Art>,
+    terrain: Res<Terrain>,
     icon_art: Res<IconArt>,
     mut rng: ResMut<Rng>,
     mut sounds: ResMut<Sounds>,
@@ -1250,9 +1344,9 @@ fn fire_weapons(
             commands.spawn((
                 RoundEntity,
                 Spark { vel: vel + car.vel * 0.5, life: rng.range(0.1, 0.25) },
-                Mesh2d(art.spark_mesh.clone()),
-                MeshMaterial2d(art.exhaust_mat.clone()),
-                Transform::from_translation(back.extend(-1.0)),
+                Mesh3d(art.spark_mesh.clone()),
+                MeshMaterial3d(art.exhaust_mat.clone()),
+                Transform::from_translation(back.extend(tf.translation.z + 6.0)),
             ));
         }
 
@@ -1273,9 +1367,9 @@ fn fire_weapons(
                 commands.spawn((
                     RoundEntity,
                     Projectile { kind: ProjectileKind::Bullet, owner: e, by_player: is_player, vel, life: 0.7 },
-                    Mesh2d(art.bullet_mesh.clone()),
-                    MeshMaterial2d(art.bullet_mat.clone()),
-                    Transform::from_translation(nose.extend(3.0))
+                    Mesh3d(art.bullet_mesh.clone()),
+                    MeshMaterial3d(art.bullet_mat.clone()),
+                    Transform::from_translation(nose.extend(terrain.height(nose) + SHOT_HEIGHT))
                         .with_rotation(Quat::from_rotation_z(vel.to_angle())),
                 ));
             }
@@ -1287,7 +1381,7 @@ fn fire_weapons(
                     .spawn((
                         RoundEntity,
                         Projectile { kind: ProjectileKind::Rocket, owner: e, by_player: is_player, vel, life: 2.0 },
-                        Transform::from_translation(nose.extend(3.0))
+                        Transform::from_translation(nose.extend(terrain.height(nose) + SHOT_HEIGHT))
                             .with_rotation(Quat::from_rotation_z(vel.to_angle())),
                     ))
                     .id();
@@ -1301,7 +1395,7 @@ fn fire_weapons(
                     .spawn((
                         RoundEntity,
                         Mine { by_player: is_player, arm: MINE_ARM_TIME },
-                        Transform::from_translation(tail.extend(-2.0)),
+                        Transform::from_translation(tail.extend(terrain.height(tail))),
                     ))
                     .id();
                 icons::attach_mine(&mut commands, &icon_art, mine);
@@ -1327,6 +1421,7 @@ fn move_projectiles(
     mut cars: Query<(Entity, &Transform, &mut Car, Has<Player>)>,
     mut obstacles: Query<(&Obstacle, Option<&mut Explosive>)>,
     current: Res<CurrentArena>,
+    terrain: Res<Terrain>,
 ) {
     let dt = time.delta_secs();
     let half = current.def().size / 2.0;
@@ -1342,13 +1437,15 @@ fn move_projectiles(
             commands.spawn((
                 RoundEntity,
                 Spark { vel: -dir * 60.0, life: 0.15 },
-                Mesh2d(art.spark_mesh.clone()),
-                MeshMaterial2d(art.spark_mat.clone()),
-                Transform::from_translation(back.extend(2.0)),
+                Mesh3d(art.spark_mesh.clone()),
+                MeshMaterial3d(art.spark_mat.clone()),
+                Transform::from_translation(back.extend(tf.translation.z)),
             ));
         }
         tf.translation += (shot.vel * dt).extend(0.0);
         let pos = tf.translation.truncate();
+        // Shots skim over the ground, following hills and dips.
+        tf.translation.z = terrain.height(pos) + SHOT_HEIGHT;
 
         // What did it hit?
         let out_of_bounds = pos.x.abs() > half.x + 200.0 || pos.y.abs() > half.y + 200.0;
@@ -1379,13 +1476,13 @@ fn move_projectiles(
                     sounds.play(Sfx::BulletHit, if shot.by_player || is_player { 0.5 } else { 0.25 });
                     let push = 25.0 / car.mass();
                     car.vel += shot.vel.normalize_or_zero() * push;
-                    spawn_sparks(&mut commands, &art, &mut rng, pos, -shot.vel.normalize_or_zero(), 30.0);
+                    spawn_sparks(&mut commands, &art, &mut rng, tf.translation, -shot.vel.normalize_or_zero(), 30.0);
                 } else if let Some(explosive) = hit_wall {
                     if let Some(mut barrel) = explosive {
                         barrel.hp -= 4.0;
                         barrel.by_player = shot.by_player;
                     }
-                    spawn_sparks(&mut commands, &art, &mut rng, pos, -shot.vel.normalize_or_zero(), 20.0);
+                    spawn_sparks(&mut commands, &art, &mut rng, tf.translation, -shot.vel.normalize_or_zero(), 20.0);
                 }
             }
             ProjectileKind::Rocket => blasts.0.push(Blast {
@@ -1448,6 +1545,7 @@ fn detonate_barrels(
 fn resolve_blasts(
     mut commands: Commands,
     art: Res<Art>,
+    terrain: Res<Terrain>,
     mut rng: ResMut<Rng>,
     mut score: ResMut<Score>,
     mut blasts: ResMut<PendingBlasts>,
@@ -1480,16 +1578,17 @@ fn resolve_blasts(
             car.vel += push * BLAST_KNOCKBACK * (0.3 + 0.7 * falloff) / mass;
         }
 
+        let center = blast.pos.extend(terrain.height(blast.pos) + 10.0);
         commands.spawn((
             RoundEntity,
             Explosion { radius: blast.radius, life: 0.0 },
-            Mesh2d(art.blast_mesh.clone()),
-            MeshMaterial2d(art.blast_mat.clone()),
-            Transform::from_translation(blast.pos.extend(6.0)),
+            Mesh3d(art.blast_mesh.clone()),
+            MeshMaterial3d(art.blast_mat.clone()),
+            Transform::from_translation(center),
         ));
         for i in 0..4 {
             let dir = Vec2::from_angle(i as f32 * std::f32::consts::FRAC_PI_2);
-            spawn_sparks(&mut commands, &art, &mut rng, blast.pos, dir, 220.0);
+            spawn_sparks(&mut commands, &art, &mut rng, center, dir, 220.0);
         }
     }
 }
@@ -1498,6 +1597,7 @@ fn resolve_blasts(
 // Power-ups
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_pickups(
     mut commands: Commands,
     time: Res<Time>,
@@ -1508,6 +1608,7 @@ fn spawn_pickups(
     cars: Query<&Transform, With<Car>>,
     obstacles: Query<&Obstacle>,
     current: Res<CurrentArena>,
+    terrain: Res<Terrain>,
 ) {
     timer.0 -= time.delta_secs();
     if timer.0 > 0.0 {
@@ -1546,8 +1647,9 @@ fn spawn_pickups(
         .spawn((
             RoundEntity,
             Pickup(kind),
+            Hover(terrain.height(pos) + PICKUP_HOVER),
             Icon { color: kind.color(), size: Vec2::splat(60.0), layer: 2 },
-            Transform::from_translation(pos.extend(-3.0)),
+            Transform::from_translation(pos.extend(terrain.height(pos) + PICKUP_HOVER)),
         ))
         .id();
     icons::attach_pickup_icon(&mut commands, &icon_art, index, pickup);
@@ -1599,12 +1701,13 @@ fn collect_pickups(
     }
 }
 
-/// Pickups wobble and breathe so they catch the eye.
-fn spin_pickups(time: Res<Time>, mut q: Query<&mut Transform, With<Pickup>>) {
+/// Pickups wobble, bob and breathe so they catch the eye.
+fn spin_pickups(time: Res<Time>, mut q: Query<(&mut Transform, &Hover), With<Pickup>>) {
     let t = time.elapsed_secs();
-    for mut tf in &mut q {
+    for (mut tf, hover) in &mut q {
         tf.rotation = Quat::from_rotation_z((t * 2.0).sin() * 0.25);
         tf.scale = Vec3::splat(1.0 + 0.06 * (t * 4.0).sin());
+        tf.translation.z = hover.0 + 3.0 * (t * 3.0).sin();
     }
 }
 
@@ -1616,7 +1719,7 @@ fn spawn_sparks(
     commands: &mut Commands,
     art: &Art,
     rng: &mut Rng,
-    at: Vec2,
+    at: Vec3,
     dir: Vec2,
     strength: f32,
 ) {
@@ -1629,9 +1732,9 @@ fn spawn_sparks(
         commands.spawn((
             RoundEntity,
             Spark { vel, life: rng.range(0.2, 0.5) },
-            Mesh2d(art.spark_mesh.clone()),
-            MeshMaterial2d(art.spark_mat.clone()),
-            Transform::from_translation(at.extend(5.0)),
+            Mesh3d(art.spark_mesh.clone()),
+            MeshMaterial3d(art.spark_mat.clone()),
+            Transform::from_translation(at),
         ));
     }
 }
@@ -1643,7 +1746,7 @@ fn update_car_visuals(
     time: Res<Time>,
     art: Res<Art>,
     mut rng: ResMut<Rng>,
-    mut materials: ResMut<Assets<ColorMaterial>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
     mut sounds: ResMut<Sounds>,
     mut q: Query<(&Transform, &mut Car, Option<&mut Icon>)>,
 ) {
@@ -1654,9 +1757,9 @@ fn update_car_visuals(
         for (handle, base) in car.paint.handles.iter().zip(car.paint.colors) {
             let color = charred.mix(&base, mix);
             if let Some(mut mat) = materials.get_mut(handle)
-                && mat.color != color
+                && mat.base_color != color
             {
-                mat.color = color;
+                mat.base_color = color;
             }
         }
         if !car.alive() && !car.wrecked {
@@ -1677,9 +1780,10 @@ fn update_car_visuals(
             commands.spawn((
                 RoundEntity,
                 Smoke { vel: drift - car.vel * 0.15, life, max_life: life },
-                Mesh2d(art.smoke_mesh.clone()),
-                MeshMaterial2d(art.smoke_mat.clone()),
-                Transform::from_translation(pos.extend(4.0)).with_scale(Vec3::splat(4.0)),
+                Mesh3d(art.smoke_mesh.clone()),
+                MeshMaterial3d(art.smoke_mat.clone()),
+                Transform::from_translation(pos.extend(tf.translation.z + cars::roof_height(car.model)))
+                    .with_scale(Vec3::splat(4.0)),
             ));
         }
     }
@@ -1690,12 +1794,16 @@ fn draw_health_bars(mut gizmos: Gizmos, time: Res<Time>, q: Query<(&Transform, &
         if !car.alive() {
             continue;
         }
-        let pos = tf.translation.truncate();
         let health = car.health();
-        let left = pos + Vec2::new(-20.0, car.model.size.x * 0.5 + 10.0);
-        gizmos.line_2d(left, left + Vec2::X * 40.0, Color::srgb(0.3, 0.05, 0.05));
+        // Floats just above the roof, behind the car on screen.
+        let left = tf.translation
+            + Vec3::new(-20.0, car.model.size.x * 0.5 + 10.0, cars::roof_height(car.model) + 8.0);
+        let line = |gizmos: &mut Gizmos, a: Vec2, b: Vec2, c: Color| {
+            gizmos.line(left + a.extend(0.0), left + b.extend(0.0), c);
+        };
+        line(&mut gizmos, Vec2::ZERO, Vec2::X * 40.0, Color::srgb(0.3, 0.05, 0.05));
         let bar = Color::srgb(1.0 - health, health, 0.15);
-        gizmos.line_2d(left, left + Vec2::X * 40.0 * health, bar);
+        line(&mut gizmos, Vec2::ZERO, Vec2::X * 40.0 * health, bar);
 
         // A small coloured dot shows what weapon a car is carrying.
         let weapon_color = match armory.weapon {
@@ -1705,17 +1813,17 @@ fn draw_health_bars(mut gizmos: Gizmos, time: Res<Time>, q: Query<(&Transform, &
             Weapon::Mines => Some(PickupKind::Mines.color()),
         };
         if let Some(c) = weapon_color {
-            gizmos.circle_2d(left + Vec2::new(48.0, 0.0), 4.0, c);
+            gizmos.circle(Isometry3d::from_translation(left + Vec3::new(48.0, 0.0, 0.0)), 4.0, c);
         }
 
         // Bobbing arrow above the player's car.
         if is_player {
             let bob = (time.elapsed_secs() * 5.0).sin() * 2.0;
-            let tip = left + Vec2::new(20.0, 8.0 + bob);
+            let tip = Vec2::new(20.0, 8.0 + bob);
             let white = Color::srgb(1.0, 1.0, 1.0);
-            gizmos.line_2d(tip, tip + Vec2::new(-6.0, 7.0), white);
-            gizmos.line_2d(tip, tip + Vec2::new(6.0, 7.0), white);
-            gizmos.line_2d(tip + Vec2::new(-6.0, 7.0), tip + Vec2::new(6.0, 7.0), white);
+            line(&mut gizmos, tip, tip + Vec2::new(-6.0, 7.0), white);
+            line(&mut gizmos, tip, tip + Vec2::new(6.0, 7.0), white);
+            line(&mut gizmos, tip + Vec2::new(-6.0, 7.0), tip + Vec2::new(6.0, 7.0), white);
         }
     }
 }
@@ -1751,7 +1859,7 @@ fn update_smoke(
             continue;
         }
         let age = 1.0 - smoke.life / smoke.max_life;
-        tf.translation += (smoke.vel * dt).extend(0.0);
+        tf.translation += (smoke.vel * dt).extend(30.0 * dt);
         // Puffs grow, then shrink away as they fade.
         tf.scale = Vec3::splat(4.0 + 10.0 * age.sqrt() * (1.0 - age * age));
     }
@@ -1771,55 +1879,76 @@ fn update_explosions(
         }
         let t = ex.life / DURATION;
         // Expand fast, then shrink away.
-        let size = ex.radius * t.sqrt() * (1.0 - t * t);
-        tf.scale = Vec3::splat(size.max(1.0));
+        let size = (ex.radius * t.sqrt() * (1.0 - t * t)).max(1.0);
+        tf.scale = Vec3::new(size, size, size * 0.6);
     }
 }
 
 /// Follow the player with a little look-ahead, zoom out with speed, and stay
 /// inside the arena. Without a player (balance sims) show the whole arena.
-#[allow(clippy::type_complexity)]
+///
+/// The camera always looks straight down; zoom is how many world units per
+/// screen pixel there are at ground level, which sets the camera's height.
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn camera_follow(
     time: Res<Time>,
     state: Res<State<GameState>>,
     current: Res<CurrentArena>,
+    terrain: Res<Terrain>,
     window: Single<&Window, With<PrimaryWindow>>,
-    player: Query<(&Transform, &Car), (With<Player>, Without<Camera2d>)>,
-    camera: Single<(&mut Transform, &mut Projection), With<Camera2d>>,
+    player: Query<(&Transform, &Car), (With<Player>, Without<Camera3d>)>,
+    camera: Single<&mut Transform, (With<Camera3d>, Without<Car>)>,
+    light: Single<&mut bevy::light::CascadeShadowConfig>,
+    mut zoom: Local<Option<f32>>,
+    mut ground: Local<f32>,
 ) {
-    let (mut tf, mut projection) = camera.into_inner();
-    let Projection::Orthographic(ortho) = &mut *projection else { return };
-    let view = Vec2::new(window.width(), window.height());
+    let mut tf = camera.into_inner();
+    let view = Vec2::new(window.width(), window.height()).max(Vec2::ONE);
 
-    if *state.get() == GameState::Garage {
+    let (target, target_zoom, target_ground, snap) = if *state.get() == GameState::Garage {
         // The showroom is laid out for 1280x800; fit it to whatever the window is.
-        tf.translation = Vec3::new(0.0, 24.0, tf.translation.z);
-        ortho.scale = (Vec2::new(1280.0, 800.0) / view).max_element().max(1.0);
-        return;
-    }
-
-    let arena = current.def().size;
-    let (target, zoom) = match player.single() {
-        Ok((ptf, car)) => {
-            let speed = car.vel.length();
-            (ptf.translation.truncate() + car.vel * 0.3, 1.0 + (speed / 800.0).min(1.0) * 0.2)
-        }
-        Err(_) => {
-            let fit = ((arena + Vec2::splat(200.0)) / view).max_element();
-            (Vec2::new(0.0, 30.0 * fit), fit)
+        let fit = (Vec2::new(1280.0, 800.0) / view).max_element().max(1.0);
+        (Vec2::new(0.0, 24.0), fit, 0.0, true)
+    } else {
+        let arena = current.def().size;
+        match player.single() {
+            Ok((ptf, car)) => {
+                let speed = car.vel.length();
+                let pos = ptf.translation.truncate();
+                (pos + car.vel * 0.3, 1.0 + (speed / 800.0).min(1.0) * 0.2, ptf.translation.z, false)
+            }
+            Err(_) => {
+                let fit = ((arena + Vec2::splat(200.0)) / view).max_element();
+                (Vec2::new(0.0, 30.0 * fit), fit, terrain.height(Vec2::ZERO), false)
+            }
         }
     };
 
-    let k = 1.0 - (-4.0 * time.delta_secs()).exp();
-    ortho.scale += (zoom - ortho.scale) * k;
+    let k = if snap { 1.0 } else { 1.0 - (-4.0 * time.delta_secs()).exp() };
+    let z = zoom.get_or_insert(target_zoom);
+    *z += (target_zoom - *z) * k;
+    *ground += (target_ground - *ground) * k;
     let mut pos = tf.translation.truncate();
     pos += (target - pos) * k;
 
-    // Don't show more than a strip of the outfield.
-    let room = arena / 2.0 + Vec2::splat(160.0) - view / 2.0 * ortho.scale;
-    pos.x = if room.x > 0.0 { pos.x.clamp(-room.x, room.x) } else { 0.0 };
-    pos.y = if room.y > 0.0 { pos.y.clamp(-room.y, room.y) } else { 0.0 };
-    tf.translation = pos.extend(tf.translation.z);
+    if *state.get() != GameState::Garage {
+        // Don't show more than a strip of the outfield.
+        let arena = current.def().size;
+        let room = arena / 2.0 + Vec2::splat(160.0) - view / 2.0 * *z;
+        pos.x = if room.x > 0.0 { pos.x.clamp(-room.x, room.x) } else { 0.0 };
+        pos.y = if room.y > 0.0 { pos.y.clamp(-room.y, room.y) } else { 0.0 };
+    }
+    let height = camera_height(view.y * *z);
+    tf.translation = pos.extend(*ground + height);
+
+    // Keep shadows reaching the ground as the camera climbs and dives.
+    let mut cascades = light.into_inner();
+    let reach = cascades.bounds.last().copied().unwrap_or(0.0);
+    let want = shadow_cascades(height);
+    let want_reach = want.bounds.last().copied().unwrap_or(0.0);
+    if (reach - want_reach).abs() > want_reach * 0.1 {
+        *cascades = want;
+    }
 }
 
 fn update_hud(

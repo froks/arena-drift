@@ -12,6 +12,7 @@ use bevy::prelude::*;
 
 use crate::RoundEntity;
 use crate::physics::{Contact, Obb};
+use crate::terrain::{Canvas, Terrain, berm, bump, smoothstep};
 
 /// What an arena is used for. Only derbies exist so far; a race track would
 /// add `Race { checkpoints, laps }` and reuse walls/obstacles as borders.
@@ -39,6 +40,8 @@ pub struct ArenaDef {
     pub theme: Theme,
     pub seed: u32,
     pub build: fn(&mut Layout),
+    /// Ground height at a point, given the arena size. See [`crate::terrain`].
+    pub relief: fn(Vec2, Vec2) -> f32,
 }
 
 pub static ARENAS: [ArenaDef; 3] = [
@@ -56,6 +59,7 @@ pub static ARENAS: [ArenaDef; 3] = [
         },
         seed: 11,
         build: dust_bowl,
+        relief: dust_bowl_relief,
     },
     ArenaDef {
         name: "Junkyard",
@@ -71,6 +75,7 @@ pub static ARENAS: [ArenaDef; 3] = [
         },
         seed: 23,
         build: junkyard,
+        relief: junkyard_relief,
     },
     ArenaDef {
         name: "Timberland",
@@ -86,6 +91,7 @@ pub static ARENAS: [ArenaDef; 3] = [
         },
         seed: 37,
         build: timberland,
+        relief: timberland_relief,
     },
 ];
 
@@ -384,6 +390,35 @@ impl Layout {
 // The arenas
 // ---------------------------------------------------------------------------
 
+/// A real bowl: a flat floor in the middle, rising to a rim at the walls.
+fn dust_bowl_relief(p: Vec2, size: Vec2) -> f32 {
+    let r = (p / (size / 2.0)).length();
+    -30.0 + 100.0 * smoothstep(0.3, 1.0, r) + berm(p, size, 60.0)
+}
+
+/// Mostly level, with a drainage ditch snaking across and a few junk mounds.
+fn junkyard_relief(p: Vec2, size: Vec2) -> f32 {
+    let ditch = p.y - 160.0 * (p.x / 420.0).sin();
+    let mounds = [
+        (Vec2::new(-470.0, -430.0), 180.0, 55.0),
+        (Vec2::new(470.0, 430.0), 180.0, 55.0),
+        (Vec2::new(-900.0, 600.0), 220.0, 45.0),
+        (Vec2::new(900.0, -600.0), 220.0, 45.0),
+    ];
+    -55.0 * (-(ditch * ditch) / (110.0 * 110.0)).exp()
+        + mounds.iter().map(|&(at, r, h)| bump(p, at, r, h)).sum::<f32>()
+        + berm(p, size, 50.0)
+}
+
+/// Rolling forest floor cut by a winding creek valley.
+fn timberland_relief(p: Vec2, size: Vec2) -> f32 {
+    let creek = p.y - (230.0 * (p.x / 520.0).sin() - 120.0);
+    28.0 * (p.x / 330.0 + 0.7).sin() * (p.y / 280.0 - 0.4).cos()
+        + 20.0 * ((p.x - 0.6 * p.y) / 450.0).sin()
+        - 80.0 * (-(creek * creek) / (170.0 * 170.0)).exp()
+        + berm(p, size, 70.0)
+}
+
 fn dust_bowl(l: &mut Layout) {
     let h = l.half();
     let white = Color::srgba(1.0, 1.0, 1.0, 0.22);
@@ -583,114 +618,150 @@ pub fn spawn_points(obstacles: &[Obstacle], size: Vec2, count: usize) -> (Vec<(V
 // Drawing
 // ---------------------------------------------------------------------------
 
+/// How far the boundary walls stand above the ground.
+const WALL_HEIGHT: f32 = 40.0;
+
 #[derive(Clone, Copy)]
 enum M {
-    Square,
-    Circle,
-    Ring,
+    Cube,
+    /// Cylinder standing on its end (axis along Z).
+    Cyl,
+    Ball,
+    /// Faceted lump.
     Rock,
+    /// Ring lying flat (axis along Z).
+    Torus,
 }
 
 /// Shared unit meshes and a material cache keyed by colour.
 #[derive(Resource)]
 pub struct ArenaArt {
-    square: Handle<Mesh>,
-    circle: Handle<Mesh>,
-    ring: Handle<Mesh>,
+    cube: Handle<Mesh>,
+    cyl: Handle<Mesh>,
+    ball: Handle<Mesh>,
     rock: Handle<Mesh>,
-    mats: HashMap<u32, Handle<ColorMaterial>>,
+    torus: Handle<Mesh>,
+    mats: HashMap<(u32, bool), Handle<StandardMaterial>>,
 }
 
 impl FromWorld for ArenaArt {
     fn from_world(world: &mut World) -> Self {
         let mut meshes = world.resource_mut::<Assets<Mesh>>();
+        let upright = Quat::from_rotation_x(FRAC_PI_2);
+        let mut rock: Mesh = Sphere::new(1.0).mesh().ico(1).expect("valid icosphere");
+        rock.duplicate_vertices();
+        rock.compute_flat_normals();
         Self {
-            square: meshes.add(Rectangle::new(1.0, 1.0)),
-            circle: meshes.add(Circle::new(1.0)),
-            ring: meshes.add(Annulus::new(0.93, 1.0)),
-            rock: meshes.add(RegularPolygon::new(1.0, 7)),
+            cube: meshes.add(Cuboid::new(1.0, 1.0, 1.0)),
+            cyl: meshes.add(Mesh::from(Cylinder::new(1.0, 1.0)).rotated_by(upright)),
+            ball: meshes.add(Sphere::new(1.0).mesh().ico(3).expect("valid icosphere")),
+            rock: meshes.add(rock),
+            torus: meshes.add(Mesh::from(Torus::new(0.3, 1.0)).rotated_by(upright)),
             mats: HashMap::new(),
         }
     }
 }
 
+/// A plain matte material. `unlit` ones glow at their own colour.
+pub fn surface(color: Color, unlit: bool) -> StandardMaterial {
+    StandardMaterial {
+        base_color: color,
+        perceptual_roughness: 0.9,
+        reflectance: 0.2,
+        unlit,
+        alpha_mode: if color.alpha() < 1.0 { AlphaMode::Blend } else { AlphaMode::Opaque },
+        ..default()
+    }
+}
+
+/// Tree tops inside the arena fade out while the player drives underneath.
+#[derive(Component)]
+pub struct Canopy {
+    radius: f32,
+    alpha: f32,
+    materials: Vec<Handle<StandardMaterial>>,
+}
+
 struct Painter<'a, 'w, 's> {
     commands: &'a mut Commands<'w, 's>,
     art: &'a mut ArenaArt,
-    materials: &'a mut Assets<ColorMaterial>,
+    materials: &'a mut Assets<StandardMaterial>,
+    terrain: Terrain,
 }
 
 impl Painter<'_, '_, '_> {
-    fn mat(&mut self, c: Color) -> Handle<ColorMaterial> {
-        let key = u32::from_le_bytes(c.to_srgba().to_u8_array());
+    fn material(&mut self, c: Color, unlit: bool) -> Handle<StandardMaterial> {
+        let key = (u32::from_le_bytes(c.to_srgba().to_u8_array()), unlit);
         let materials = &mut *self.materials;
-        self.art.mats.entry(key).or_insert_with(|| materials.add(c)).clone()
+        self.art.mats.entry(key).or_insert_with(|| materials.add(surface(c, unlit))).clone()
     }
 
-    fn root(&mut self, pos: Vec2, z: f32, rot: f32) -> Entity {
+    /// Something standing on the ground at `pos`, sunk to the lowest point
+    /// under a footprint of radius `footprint` so it never floats on a slope.
+    fn root(&mut self, pos: Vec2, rot: f32, footprint: f32) -> Entity {
+        let z = self.terrain.lowest(pos, footprint);
+        self.root_at(pos.extend(z), Quat::from_rotation_z(rot))
+    }
+
+    fn root_at(&mut self, at: Vec3, rotation: Quat) -> Entity {
         self.commands
-            .spawn((
-                RoundEntity,
-                Transform::from_translation(pos.extend(z)).with_rotation(Quat::from_rotation_z(rot)),
-                Visibility::default(),
-            ))
+            .spawn((RoundEntity, Transform::from_translation(at).with_rotation(rotation), Visibility::default()))
             .id()
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn add(&mut self, root: Entity, m: M, color: Color, at: Vec2, z: f32, rot: f32, scale: Vec2) {
+    fn add(&mut self, root: Entity, m: M, material: Handle<StandardMaterial>, at: Vec3, rot: Quat, scale: Vec3) {
         let mesh = match m {
-            M::Square => self.art.square.clone(),
-            M::Circle => self.art.circle.clone(),
-            M::Ring => self.art.ring.clone(),
+            M::Cube => self.art.cube.clone(),
+            M::Cyl => self.art.cyl.clone(),
+            M::Ball => self.art.ball.clone(),
             M::Rock => self.art.rock.clone(),
+            M::Torus => self.art.torus.clone(),
         };
-        let material = self.mat(color);
         let child = self
             .commands
             .spawn((
-                Mesh2d(mesh),
-                MeshMaterial2d(material),
-                Transform::from_translation(at.extend(z))
-                    .with_rotation(Quat::from_rotation_z(rot))
-                    .with_scale(scale.extend(1.0)),
+                Mesh3d(mesh),
+                MeshMaterial3d(material),
+                Transform::from_translation(at).with_rotation(rot).with_scale(scale),
             ))
             .id();
         self.commands.entity(root).add_child(child);
     }
 
-    fn shadow(&mut self, root: Entity, m: M, scale: Vec2) {
-        self.add(root, m, Color::srgba(0.0, 0.0, 0.0, 0.3), Vec2::new(3.0, -4.0), -0.05, 0.0, scale * 1.08);
+    fn part(&mut self, root: Entity, m: M, color: Color, at: Vec3, scale: Vec3) {
+        let material = self.material(color, false);
+        self.add(root, m, material, at, Quat::IDENTITY, scale);
+    }
+
+    /// A box whose bottom sits at `base`.
+    fn block(&mut self, root: Entity, color: Color, at: Vec2, base: f32, size: Vec3) {
+        self.part(root, M::Cube, color, at.extend(base + size.z / 2.0), size);
+    }
+
+    /// An upright cylinder of radius `r` whose bottom sits at `base`.
+    fn post(&mut self, root: Entity, color: Color, at: Vec2, base: f32, r: f32, height: f32) {
+        self.part(root, M::Cyl, color, at.extend(base + height / 2.0), Vec3::new(r, r, height));
     }
 }
 
-// Draw layers.
-const Z_OUTFIELD: f32 = -12.0;
-const Z_FLOOR: f32 = -10.0;
-const Z_PATCH: f32 = -9.6;
-const Z_PAINT: f32 = -9.4;
-const Z_OUTSIDE: f32 = -2.0;
-const Z_OBSTACLE: f32 = 0.5;
-const Z_CANOPY: f32 = 8.0;
-
-/// Spawn everything for an arena. Returns the obstacles so callers can
-/// pick spawn points before the entities exist.
+/// Spawn everything for an arena. Returns the obstacles (so callers can
+/// pick spawn points before the entities exist) and the ground relief.
 pub fn spawn_arena(
     commands: &mut Commands,
     art: &mut ArenaArt,
-    materials: &mut Assets<ColorMaterial>,
+    meshes: &mut Assets<Mesh>,
+    images: &mut Assets<Image>,
+    materials: &mut Assets<StandardMaterial>,
     def: &ArenaDef,
-) -> Vec<Obstacle> {
+) -> (Vec<Obstacle>, Terrain) {
     let layout = Layout::new(def);
-    let mut p = Painter { commands, art, materials };
-
-    let ground = p.root(Vec2::ZERO, Z_OUTFIELD, 0.0);
-    p.add(ground, M::Square, def.theme.outfield, Vec2::ZERO, 0.0, 0.0, def.size + Vec2::splat(2400.0));
-    let floor = p.root(Vec2::ZERO, Z_FLOOR, 0.0);
-    p.add(floor, M::Square, def.theme.floor, Vec2::ZERO, 0.0, 0.0, def.size);
+    let terrain = Terrain::new(def.relief, def.size);
+    let mut canvas = Canvas::new(def.size, def.theme.outfield);
+    canvas.rect(Vec2::ZERO, 0.0, def.size, def.theme.floor);
+    let mut p = Painter { commands, art, materials, terrain };
 
     for d in &layout.decor {
-        draw_decor(&mut p, d);
+        draw_decor(&mut p, &mut canvas, d);
     }
     for o in &layout.obstacles {
         let root = draw_obstacle(&mut p, o, &def.theme);
@@ -702,140 +773,189 @@ pub fn spawn_arena(
             p.commands.entity(root).insert(Explosive { hp: BARREL_HP, by_player: false });
         }
     }
-    layout.obstacles
+
+    let (mesh, material) = crate::terrain::build_ground(&terrain, canvas, meshes, images, p.materials);
+    p.commands.spawn((RoundEntity, mesh, material, Transform::default()));
+    (layout.obstacles, terrain)
 }
 
 fn draw_obstacle(p: &mut Painter, o: &Obstacle, theme: &Theme) -> Entity {
-    let root = p.root(o.pos, Z_OBSTACLE, o.rot);
+    let footprint = o.bounding_radius() * 0.7;
     match (o.kind, o.shape) {
         (ObstacleKind::Wall, Shape::Box(s)) => {
-            p.add(root, M::Square, theme.wall, Vec2::ZERO, 0.0, 0.0, s);
-            if let Some(stripe) = theme.wall_stripe {
-                // Stripes along the long side.
-                let (len, across, horizontal) = if s.x > s.y { (s.x, s.y, true) } else { (s.y, s.x, false) };
-                let step = 60.0;
-                let n = (len / step) as i32;
-                for i in (0..n).step_by(2) {
-                    let t = -len / 2.0 + (i as f32 + 0.5) * step;
-                    let (at, scale) = if horizontal {
-                        (Vec2::new(t, 0.0), Vec2::new(step * 0.5, across))
-                    } else {
-                        (Vec2::new(0.0, t), Vec2::new(across, step * 0.5))
-                    };
-                    p.add(root, M::Square, stripe, at, 0.01, 0.0, scale);
+            // Built from short segments so the top follows the ground.
+            let root = p.root_at(o.pos.extend(0.0), Quat::IDENTITY);
+            let (len, across, along) = if s.x > s.y { (s.x, s.y, Vec2::X) } else { (s.y, s.x, Vec2::Y) };
+            let n = (len / 60.0).round().max(1.0) as i32;
+            let seg = len / n as f32;
+            for i in 0..n {
+                let t = -len / 2.0 + (i as f32 + 0.5) * seg;
+                let at = along * t;
+                let world = o.pos + at;
+                let heights = [-0.5, 0.0, 0.5].map(|k| p.terrain.height(world + along * seg * k));
+                let lo = heights.iter().copied().fold(f32::MAX, f32::min) - 20.0;
+                let hi = heights.iter().copied().fold(f32::MIN, f32::max) + WALL_HEIGHT;
+                let size = |l: f32, a: f32, h: f32| {
+                    if along == Vec2::X { Vec3::new(l, a, h) } else { Vec3::new(a, l, h) }
+                };
+                p.block(root, theme.wall, at, lo, size(seg + 0.5, across, hi - lo));
+                if let Some(stripe) = theme.wall_stripe
+                    && i % 2 == 0
+                {
+                    p.block(root, stripe, at, lo, size(seg * 0.5, across + 0.6, hi - lo + 0.6));
                 }
             }
+            root
         }
         (ObstacleKind::TireStack, Shape::Circle(r)) => {
-            p.shadow(root, M::Circle, Vec2::splat(r));
-            p.add(root, M::Circle, Color::srgb(0.09, 0.09, 0.1), Vec2::ZERO, 0.0, 0.0, Vec2::splat(r));
-            p.add(root, M::Ring, Color::srgb(0.22, 0.22, 0.24), Vec2::ZERO, 0.01, 0.0, Vec2::splat(r * 0.8));
-            p.add(root, M::Circle, Color::srgb(0.16, 0.16, 0.17), Vec2::ZERO, 0.02, 0.0, Vec2::splat(r * 0.62));
-            p.add(root, M::Circle, Color::srgb(0.05, 0.05, 0.05), Vec2::ZERO, 0.03, 0.0, Vec2::splat(r * 0.38));
+            let root = p.root(o.pos, 0.0, footprint);
+            for k in 0..3 {
+                let shade = if k == 1 { 0.13 } else { 0.09 };
+                let z = r * 0.35 * (1 + 2 * k) as f32;
+                p.part(root, M::Torus, Color::srgb(shade, shade, shade + 0.01), Vec3::new(0.0, 0.0, z), Vec3::splat(r));
+            }
+            p.post(root, Color::srgb(0.04, 0.04, 0.04), Vec2::ZERO, 0.0, r * 0.4, r * 2.0);
+            root
         }
         (ObstacleKind::Barrel, Shape::Circle(r)) => {
-            p.shadow(root, M::Circle, Vec2::splat(r));
-            p.add(root, M::Circle, Color::srgb(0.75, 0.13, 0.08), Vec2::ZERO, 0.0, 0.0, Vec2::splat(r));
-            p.add(root, M::Ring, Color::srgb(0.5, 0.08, 0.05), Vec2::ZERO, 0.01, 0.0, Vec2::splat(r * 0.75));
-            p.add(root, M::Circle, Color::srgb(0.95, 0.8, 0.15), Vec2::ZERO, 0.02, 0.0, Vec2::splat(r * 0.3));
+            let root = p.root(o.pos, 0.0, footprint);
+            let height = r * 2.2;
+            p.post(root, Color::srgb(0.75, 0.13, 0.08), Vec2::ZERO, 0.0, r, height);
+            for z in [0.25, 0.65] {
+                p.post(root, Color::srgb(0.5, 0.08, 0.05), Vec2::ZERO, height * z, r * 1.05, 1.8);
+            }
+            p.post(root, Color::srgb(0.5, 0.08, 0.05), Vec2::ZERO, height, r * 0.8, 0.8);
+            p.post(root, Color::srgb(0.95, 0.8, 0.15), Vec2::ZERO, height, r * 0.32, 1.2);
+            root
         }
         (ObstacleKind::Concrete, Shape::Box(s)) => {
-            p.shadow(root, M::Square, s);
-            p.add(root, M::Square, Color::srgb(0.58, 0.58, 0.56), Vec2::ZERO, 0.0, 0.0, s);
-            p.add(root, M::Square, Color::srgb(0.68, 0.68, 0.66), Vec2::ZERO, 0.01, 0.0, s - Vec2::splat(10.0));
+            // Jersey barrier: wide foot, narrower top.
+            let root = p.root(o.pos, o.rot, footprint);
+            p.block(root, Color::srgb(0.56, 0.56, 0.54), Vec2::ZERO, -6.0, Vec3::new(s.x, s.y, 16.0));
+            p.block(root, Color::srgb(0.62, 0.62, 0.6), Vec2::ZERO, 10.0, Vec3::new(s.x, s.y * 0.62, 16.0));
+            p.block(root, Color::srgb(0.7, 0.7, 0.68), Vec2::ZERO, 26.0, Vec3::new(s.x, s.y * 0.4, 8.0));
             for x in [-0.25, 0.25] {
-                p.add(root, M::Square, Color::srgb(0.45, 0.45, 0.44), Vec2::new(x * s.x, 0.0), 0.02, 0.0, Vec2::new(2.0, s.y - 10.0));
+                p.block(root, Color::srgb(0.42, 0.42, 0.41), Vec2::new(x * s.x, 0.0), -6.0, Vec3::new(2.0, s.y + 0.4, 40.2));
             }
+            root
         }
         (ObstacleKind::Container, Shape::Box(s)) => {
-            p.shadow(root, M::Square, s);
-            p.add(root, M::Square, o.tint, Vec2::ZERO, 0.0, 0.0, s);
+            let root = p.root(o.pos, o.rot, footprint);
+            let height = 60.0;
+            p.block(root, o.tint, Vec2::ZERO, -8.0, Vec3::new(s.x, s.y, height + 8.0));
             let ridge = o.tint.mix(&Color::BLACK, 0.25);
             let n = 12;
             for i in 0..n {
                 let x = -s.x / 2.0 + (i as f32 + 0.5) * s.x / n as f32;
-                p.add(root, M::Square, ridge, Vec2::new(x, 0.0), 0.01, 0.0, Vec2::new(3.0, s.y - 6.0));
+                p.block(root, ridge, Vec2::new(x, 0.0), height, Vec3::new(3.0, s.y - 6.0, 1.2));
+                p.block(root, ridge, Vec2::new(x, 0.0), -8.0, Vec3::new(3.0, s.y + 1.2, height + 4.0));
             }
-            p.add(root, M::Square, o.tint.mix(&Color::BLACK, 0.45), Vec2::new(s.x / 2.0 - 3.0, 0.0), 0.02, 0.0, Vec2::new(6.0, s.y));
+            p.block(root, o.tint.mix(&Color::BLACK, 0.45), Vec2::new(s.x / 2.0 - 3.0, 0.0), -8.0, Vec3::new(6.0, s.y + 0.6, height + 8.6));
+            root
         }
-        (ObstacleKind::Tree, Shape::Circle(r)) => {
-            // Trunk only; the canopy is a decoration drawn above the cars.
-            p.add(root, M::Circle, Color::srgb(0.3, 0.2, 0.12), Vec2::ZERO, 0.0, 0.0, Vec2::splat(r));
-        }
+        // Trunk and canopy are drawn by the matching tree decoration.
+        (ObstacleKind::Tree, _) => p.root(o.pos, 0.0, 0.0),
         (ObstacleKind::Rock, Shape::Circle(r)) => {
-            p.shadow(root, M::Rock, Vec2::splat(r));
-            p.add(root, M::Rock, Color::srgb(0.42, 0.4, 0.37), Vec2::ZERO, 0.0, 0.0, Vec2::splat(r));
-            p.add(root, M::Rock, Color::srgb(0.52, 0.5, 0.46), Vec2::new(-r * 0.15, r * 0.15), 0.01, 0.6, Vec2::splat(r * 0.6));
+            let root = p.root(o.pos, o.rot, footprint);
+            p.part(root, M::Rock, Color::srgb(0.42, 0.4, 0.37), Vec3::new(0.0, 0.0, r * 0.25), Vec3::new(r, r * 0.9, r * 0.75));
+            let top = p.material(Color::srgb(0.52, 0.5, 0.46), false);
+            p.add(root, M::Rock, top, Vec3::new(-r * 0.15, r * 0.15, r * 0.55), Quat::from_rotation_z(0.6), Vec3::new(r * 0.6, r * 0.55, r * 0.5));
+            root
         }
         (ObstacleKind::Log, Shape::Box(s)) => {
-            p.shadow(root, M::Square, s);
-            p.add(root, M::Square, Color::srgb(0.4, 0.26, 0.14), Vec2::ZERO, 0.0, 0.0, s);
-            for y in [-0.2, 0.2] {
-                p.add(root, M::Square, Color::srgb(0.32, 0.2, 0.1), Vec2::new(0.0, y * s.y), 0.01, 0.0, Vec2::new(s.x - 8.0, 2.0));
-            }
+            let root = p.root(o.pos, o.rot, footprint);
+            let r = s.y / 2.0;
+            let lying = Quat::from_rotation_y(FRAC_PI_2);
+            let bark = p.material(Color::srgb(0.4, 0.26, 0.14), false);
+            p.add(root, M::Cyl, bark, Vec3::new(0.0, 0.0, r * 0.9), lying, Vec3::new(r, r, s.x));
+            let wood = p.material(Color::srgb(0.7, 0.55, 0.35), false);
             for x in [-0.5, 0.5] {
-                p.add(root, M::Circle, Color::srgb(0.7, 0.55, 0.35), Vec2::new(x * s.x, 0.0), 0.02, 0.0, Vec2::new(5.0, s.y / 2.0));
+                p.add(root, M::Cyl, wood.clone(), Vec3::new(x * (s.x + 0.6), 0.0, r * 0.9), lying, Vec3::new(r * 0.85, r * 0.85, 0.6));
             }
+            for y in [-0.2, 0.2] {
+                let z = r * 0.9 + (r * r - (y * s.y) * (y * s.y)).sqrt();
+                p.block(root, Color::srgb(0.32, 0.2, 0.1), Vec2::new(0.0, y * s.y), z - 1.0, Vec3::new(s.x - 8.0, 2.0, 1.5));
+            }
+            root
         }
         (ObstacleKind::HayBale, Shape::Box(s)) => {
-            p.shadow(root, M::Square, s);
-            p.add(root, M::Square, Color::srgb(0.85, 0.72, 0.35), Vec2::ZERO, 0.0, 0.0, s);
+            let root = p.root(o.pos, o.rot, footprint);
+            p.block(root, Color::srgb(0.85, 0.72, 0.35), Vec2::ZERO, -4.0, Vec3::new(s.x, s.y, 32.0));
             for x in [-0.22, 0.22] {
-                p.add(root, M::Square, Color::srgb(0.55, 0.4, 0.2), Vec2::new(x * s.x, 0.0), 0.01, 0.0, Vec2::new(2.5, s.y));
+                p.block(root, Color::srgb(0.55, 0.4, 0.2), Vec2::new(x * s.x, 0.0), -4.0, Vec3::new(2.5, s.y + 0.6, 32.6));
             }
+            root
         }
         (ObstacleKind::Hulk, Shape::Box(s)) => {
-            p.shadow(root, M::Square, s);
-            p.add(root, M::Square, o.tint, Vec2::ZERO, 0.0, 0.0, s);
-            p.add(root, M::Square, o.tint.mix(&Color::BLACK, 0.35), Vec2::new(-s.x * 0.08, 0.0), 0.01, 0.0, Vec2::new(s.x * 0.4, s.y * 0.8));
-            p.add(root, M::Square, Color::srgb(0.08, 0.08, 0.09), Vec2::new(s.x * 0.2, 0.0), 0.02, 0.0, Vec2::new(s.x * 0.1, s.y * 0.7));
-            p.add(root, M::Circle, Color::srgb(0.5, 0.28, 0.12), Vec2::new(-s.x * 0.3, s.y * 0.2), 0.03, 0.0, Vec2::new(7.0, 5.0));
+            // A dead car, sagging to one side.
+            let root = p.root(o.pos, o.rot, footprint);
+            let sag = p.root_at(Vec3::ZERO, Quat::from_rotation_x(0.07 * (o.rot * 3.0).sin()));
+            p.commands.entity(root).add_child(sag);
+            p.block(sag, o.tint, Vec2::ZERO, 0.0, Vec3::new(s.x, s.y, 13.0));
+            p.block(sag, o.tint.mix(&Color::BLACK, 0.35), Vec2::new(-s.x * 0.08, 0.0), 13.0, Vec3::new(s.x * 0.4, s.y * 0.8, 9.0));
+            p.block(sag, Color::srgb(0.08, 0.08, 0.09), Vec2::new(s.x * 0.2, 0.0), 12.0, Vec3::new(s.x * 0.1, s.y * 0.7, 6.0));
+            p.post(sag, Color::srgb(0.5, 0.28, 0.12), Vec2::new(-s.x * 0.3, s.y * 0.2), 13.0, 6.0, 0.6);
+            root
         }
-        _ => {}
+        _ => p.root(o.pos, o.rot, 0.0),
     }
-    root
 }
 
-fn draw_decor(p: &mut Painter, d: &Decor) {
+fn draw_decor(p: &mut Painter, canvas: &mut Canvas, d: &Decor) {
     match d.kind {
-        DecorKind::Patch => {
-            let root = p.root(d.pos, Z_PATCH, d.rot);
-            p.add(root, M::Circle, d.tint, Vec2::ZERO, 0.0, 0.0, d.size / 2.0);
-        }
+        // Flat markings are painted into the ground texture.
+        DecorKind::Patch => canvas.ellipse(d.pos, d.rot, d.size / 2.0, d.tint),
         DecorKind::OilStain => {
-            let root = p.root(d.pos, Z_PAINT + 0.1, d.rot);
             let oil = Color::srgba(0.05, 0.05, 0.06, 0.45);
-            p.add(root, M::Circle, oil, Vec2::ZERO, 0.0, 0.0, d.size / 2.0);
-            p.add(root, M::Circle, oil, d.size * Vec2::new(0.35, 0.2), 0.01, 0.0, d.size / 4.0);
+            canvas.ellipse(d.pos, d.rot, d.size / 2.0, oil);
+            let off = Vec2::from_angle(d.rot).rotate(d.size * Vec2::new(0.35, 0.2));
+            canvas.ellipse(d.pos + off, d.rot, d.size / 4.0, oil);
         }
-        DecorKind::PaintedRing => {
-            let root = p.root(d.pos, Z_PAINT, 0.0);
-            p.add(root, M::Ring, d.tint, Vec2::ZERO, 0.0, 0.0, d.size);
-        }
-        DecorKind::PaintedLine => {
-            let root = p.root(d.pos, Z_PAINT, d.rot);
-            p.add(root, M::Square, d.tint, Vec2::ZERO, 0.0, 0.0, d.size);
-        }
+        DecorKind::PaintedRing => canvas.ring(d.pos, d.size.x * 0.93, d.size.x, d.tint),
+        DecorKind::PaintedLine => canvas.rect(d.pos, d.rot, d.size, d.tint),
         DecorKind::Bush => {
-            let root = p.root(d.pos, Z_OUTSIDE, d.rot);
             let r = d.size.x;
+            let root = p.root(d.pos, d.rot, r * 0.5);
             for (off, shade) in [(Vec2::new(-0.4, -0.2), 0.0), (Vec2::new(0.4, -0.1), 0.06), (Vec2::new(0.0, 0.35), 0.12)] {
-                p.add(root, M::Circle, Color::srgb(0.16 + shade, 0.36 + shade, 0.14), off * r, shade, 0.0, Vec2::splat(r * 0.75));
+                let color = Color::srgb(0.16 + shade, 0.36 + shade, 0.14);
+                p.part(root, M::Ball, color, (off * r).extend(r * (0.35 + shade * 2.0)), Vec3::new(r, r, r * 0.8) * 0.75);
             }
         }
         DecorKind::Tree => {
-            let root = p.root(d.pos, Z_CANOPY, d.rot);
             let r = d.size.x;
-            p.add(root, M::Circle, Color::srgba(0.0, 0.0, 0.0, 0.25), Vec2::new(10.0, -14.0), -9.0, 0.0, Vec2::splat(r));
-            p.add(root, M::Circle, Color::srgba(0.12, 0.3, 0.12, 0.93), Vec2::ZERO, 0.0, 0.0, Vec2::splat(r));
-            p.add(root, M::Circle, Color::srgba(0.17, 0.4, 0.16, 0.95), Vec2::new(-r * 0.2, r * 0.15), 0.01, 0.0, Vec2::splat(r * 0.65));
-            p.add(root, M::Circle, Color::srgba(0.24, 0.5, 0.2, 0.95), Vec2::new(-r * 0.3, r * 0.25), 0.02, 0.0, Vec2::splat(r * 0.32));
+            let root = p.root(d.pos, d.rot, r * 0.25);
+            let trunk = r * 1.5;
+            p.post(root, Color::srgb(0.3, 0.2, 0.12), Vec2::ZERO, -6.0, r * 0.25, trunk + 6.0);
+            let blobs = [
+                (Vec2::ZERO, 0.0, 1.0, Color::srgb(0.12, 0.3, 0.12)),
+                (Vec2::new(-0.2, 0.15), 0.35, 0.65, Color::srgb(0.17, 0.4, 0.16)),
+                (Vec2::new(-0.3, 0.25), 0.6, 0.32, Color::srgb(0.24, 0.5, 0.2)),
+            ];
+            // Inside the arena, cars can drive under trees: give each its own
+            // materials so it can fade out over the player.
+            let inside = d.pos.x.abs() < p.terrain_half().x && d.pos.y.abs() < p.terrain_half().y;
+            let mut faders = Vec::new();
+            for (off, up, size, color) in blobs {
+                let material = if inside {
+                    let m = p.materials.add(surface(color, false));
+                    faders.push(m.clone());
+                    m
+                } else {
+                    p.material(color, false)
+                };
+                let at = (off * r).extend(trunk + up * r);
+                p.add(root, M::Ball, material, at, Quat::IDENTITY, Vec3::new(r, r, r * 0.8) * size);
+            }
+            if inside {
+                p.commands.entity(root).insert(Canopy { radius: r, alpha: 1.0, materials: faders });
+            }
         }
         DecorKind::Stand => {
-            let root = p.root(d.pos, Z_OUTSIDE, d.rot);
+            // Stepped seating rising away from the arena (local -y faces it).
             let s = d.size;
-            p.add(root, M::Square, Color::srgb(0.3, 0.3, 0.32), Vec2::ZERO, 0.0, 0.0, s);
+            let root = p.root(d.pos, d.rot, s.y * 0.3);
             let rows = 4;
+            let depth = s.y / rows as f32;
             let crowd = [
                 Color::srgb(0.85, 0.3, 0.25),
                 Color::srgb(0.25, 0.45, 0.85),
@@ -846,8 +966,11 @@ fn draw_decor(p: &mut Painter, d: &Decor) {
             ];
             let mut k = 0usize;
             for row in 0..rows {
-                let y = -s.y / 2.0 + (row as f32 + 0.6) * s.y / (rows as f32 + 0.3);
-                p.add(root, M::Square, Color::srgb(0.38, 0.38, 0.4), Vec2::new(0.0, y - 10.0), 0.01, 0.0, Vec2::new(s.x - 10.0, 4.0));
+                let front = -s.y / 2.0 + row as f32 * depth;
+                let top = 14.0 * (row + 1) as f32;
+                let shade = 0.3 + 0.04 * (row % 2) as f32;
+                let y = (front + s.y / 2.0) / 2.0;
+                p.block(root, Color::srgb(shade, shade, shade + 0.02), Vec2::new(0.0, y), -20.0, Vec3::new(s.x, s.y / 2.0 - front, top + 20.0));
                 let n = (s.x / 16.0) as i32;
                 for i in 0..n {
                     k = k.wrapping_mul(1_103_515_245).wrapping_add(12_345 + i as usize);
@@ -855,19 +978,27 @@ fn draw_decor(p: &mut Painter, d: &Decor) {
                         continue; // empty seat
                     }
                     let x = -s.x / 2.0 + (i as f32 + 0.5) * s.x / n as f32;
-                    p.add(root, M::Circle, crowd[(k >> 8) % crowd.len()], Vec2::new(x, y), 0.02, 0.0, Vec2::splat(5.0));
+                    let fan = crowd[(k >> 8) % crowd.len()];
+                    p.part(root, M::Ball, fan, Vec3::new(x, front + depth * 0.55, top + 5.0), Vec3::new(5.0, 5.0, 6.0));
                 }
             }
+            p.block(root, Color::srgb(0.22, 0.22, 0.24), Vec2::new(0.0, s.y / 2.0 - 4.0), -20.0, Vec3::new(s.x, 8.0, 14.0 * rows as f32 + 60.0));
         }
         DecorKind::Floodlight => {
-            let root = p.root(d.pos, Z_OUTSIDE, 0.0);
-            p.add(root, M::Circle, Color::srgba(1.0, 0.95, 0.7, 0.08), Vec2::ZERO, 0.0, 0.0, Vec2::splat(140.0));
-            p.add(root, M::Square, Color::srgb(0.2, 0.2, 0.22), Vec2::ZERO, 0.01, 0.0, Vec2::splat(18.0));
-            p.add(root, M::Square, Color::srgb(1.0, 0.95, 0.75), Vec2::ZERO, 0.02, 0.0, Vec2::new(14.0, 6.0));
+            canvas.ellipse(d.pos, 0.0, Vec2::splat(140.0), Color::srgba(1.0, 0.95, 0.7, 0.08));
+            let facing = (-d.pos).to_angle();
+            let root = p.root(d.pos, facing, 10.0);
+            let steel = Color::srgb(0.2, 0.2, 0.22);
+            p.block(root, steel, Vec2::ZERO, -4.0, Vec3::new(24.0, 24.0, 14.0));
+            p.post(root, steel, Vec2::ZERO, 0.0, 5.0, 230.0);
+            p.block(root, steel, Vec2::new(4.0, 0.0), 225.0, Vec3::new(16.0, 44.0, 22.0));
+            let lamp = p.material(Color::srgb(1.0, 0.95, 0.75), true);
+            p.add(root, M::Cube, lamp.clone(), Vec3::new(12.5, 0.0, 236.0), Quat::IDENTITY, Vec3::new(1.5, 38.0, 16.0));
+            p.add(root, M::Cube, lamp, Vec3::new(4.0, 0.0, 247.5), Quat::IDENTITY, Vec3::new(12.0, 38.0, 1.5));
         }
         DecorKind::ScrapPile => {
-            let root = p.root(d.pos, Z_OUTSIDE, d.rot);
             let s = d.size.x;
+            let root = p.root(d.pos, d.rot, s * 0.3);
             let greys = [
                 Color::srgb(0.35, 0.33, 0.3),
                 Color::srgb(0.45, 0.28, 0.18),
@@ -877,13 +1008,55 @@ fn draw_decor(p: &mut Painter, d: &Decor) {
             for i in 0..7 {
                 let a = i as f32 * 2.4;
                 let off = Vec2::from_angle(a) * s * 0.25 * ((i % 3) as f32 * 0.5 + 0.3);
-                p.add(root, M::Square, greys[i % greys.len()], off, i as f32 * 0.01, a, Vec2::new(s * 0.45, s * 0.22));
+                // Pieces nearer the middle sit higher up the heap.
+                let z = s * 0.2 * (1.0 - off.length() / (s * 0.4)).max(0.0);
+                let tilt = Quat::from_rotation_z(a) * Quat::from_rotation_x(0.25 * ((i % 3) as f32 - 1.0));
+                let material = p.material(greys[i % greys.len()], false);
+                p.add(root, M::Cube, material, off.extend(z), tilt, Vec3::new(s * 0.45, s * 0.22, s * 0.12));
             }
         }
         DecorKind::GrassTuft => {
-            let root = p.root(d.pos, Z_PAINT, 0.0);
+            let root = p.root(d.pos, 0.0, 4.0);
             for (i, off) in [Vec2::new(-4.0, 0.0), Vec2::new(0.0, 3.0), Vec2::new(4.0, -1.0)].into_iter().enumerate() {
-                p.add(root, M::Square, Color::srgb(0.2, 0.33 + i as f32 * 0.04, 0.15), off, 0.0, 0.3 * (i as f32 - 1.0), Vec2::new(2.0, 9.0));
+                let lean = i as f32 - 1.0;
+                let blade = p.material(Color::srgb(0.2, 0.33 + i as f32 * 0.04, 0.15), false);
+                let rot = Quat::from_rotation_z(0.3 * lean) * Quat::from_rotation_y(0.3 * lean);
+                p.add(root, M::Cube, blade, off.extend(4.0), rot, Vec3::new(2.0, 2.0, 10.0));
+            }
+        }
+    }
+}
+
+impl Painter<'_, '_, '_> {
+    fn terrain_half(&self) -> Vec2 {
+        self.terrain.size() / 2.0
+    }
+}
+
+/// Fade tree tops the player is driving under, so they don't hide the car.
+pub fn fade_canopies(
+    time: Res<Time>,
+    player: Query<&Transform, With<crate::Player>>,
+    mut canopies: Query<(&Transform, &mut Canopy)>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    let player = player.single().ok().map(|t| t.translation.truncate());
+    let k = 1.0 - (-8.0 * time.delta_secs()).exp();
+    for (tf, mut canopy) in &mut canopies {
+        let under = player.is_some_and(|p| p.distance(tf.translation.truncate()) < canopy.radius + 20.0);
+        let target = if under { 0.3 } else { 1.0 };
+        if (canopy.alpha - target).abs() < 0.01 {
+            continue;
+        }
+        canopy.alpha += (target - canopy.alpha) * k;
+        if (canopy.alpha - target).abs() < 0.01 {
+            canopy.alpha = target;
+        }
+        for handle in &canopy.materials {
+            if let Some(mut m) = materials.get_mut(handle) {
+                m.base_color.set_alpha(canopy.alpha);
+                // Opaque when solid, so it still casts a shadow.
+                m.alpha_mode = if canopy.alpha < 1.0 { AlphaMode::Blend } else { AlphaMode::Opaque };
             }
         }
     }

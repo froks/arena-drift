@@ -3,7 +3,7 @@
 [![CI](https://github.com/froks/arena-drift/actions/workflows/ci.yml/badge.svg)](https://github.com/froks/arena-drift/actions/workflows/ci.yml)
 [![Web build](https://github.com/froks/arena-drift/actions/workflows/pages.yml/badge.svg)](https://github.com/froks/arena-drift/actions/workflows/pages.yml)
 
-A top-down demolition derby written in Rust with [Bevy](https://bevy.org). Pick a car, drive into the arena,
+A top-down 3D demolition derby written in Rust with [Bevy](https://bevy.org). Pick a car, drive into the arena,
 and wreck your rivals until you're the last one still running.
 
 **▶ [Play in your browser](https://froks.github.io/arena-drift/)**, download a build for Linux, Windows or macOS
@@ -21,10 +21,14 @@ build it yourself (see below).
   stay in the arena as obstacles.
 - **12 cars in 3 tiers.** Each has its own size, weight, handling and toughness. Your rivals always come from your
   tier.
+- **3D arenas with real terrain.** Everything is built from 3D shapes and lit by a low sun that casts shadows.
+  The camera looks straight down, but tall things lean out and slide past as you drive (parallax). Slopes pull
+  cars downhill, so valleys collect wrecks.
 - **3 arenas:**
-  - *Dust Bowl:* tire chicanes, concrete blocks and a crowd in the stands.
-  - *Junkyard:* lanes of containers and rusting wrecks.
-  - *Timberland:* trees, logs, rocks and hay bales.
+  - *Dust Bowl:* a real bowl, with tyre chicanes, concrete blocks and a crowd in the stands.
+  - *Junkyard:* lanes of containers and rusting wrecks, a drainage ditch and junk mounds.
+  - *Timberland:* rolling forest floor cut by a creek valley, with trees, logs, rocks and hay bales. Tree tops
+    fade out while you drive under them.
 - **Obstacles that behave differently.** Tire stacks are bouncy and soft, concrete and rock hurt, and red barrels
   explode (shoot them, ram them, or set off a chain reaction).
 - **Power-ups:** health packs, a machine gun, rockets, mines and turbo.
