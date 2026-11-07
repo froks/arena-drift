@@ -622,6 +622,7 @@ fn main() {
                 cars::steer_front_wheels,
                 arena::fade_canopies,
                 river_ripples.run_if(resource_exists::<Track>),
+                update_droplets,
                 (attach_health_bars, update_health_bars).chain().after(follow_terrain),
                 camera_follow.after(follow_terrain),
             ),
@@ -724,7 +725,8 @@ fn setup_world(
         arrow_mesh: meshes.add(Triangle2d::new(Vec2::new(0.0, -5.0), Vec2::new(6.0, 4.0), Vec2::new(-6.0, 4.0))),
         bar_back_mat: materials.add(glow(Color::srgb(0.12, 0.03, 0.03))),
         white_mat: materials.add(glow(Color::WHITE)),
-        spray_mat: materials.add(glow(Color::srgba(0.85, 0.93, 1.0, 0.75))),
+        // Drawn over the water.
+        spray_mat: materials.add(StandardMaterial { depth_bias: 40.0, ..glow(Color::srgba(0.93, 0.97, 1.0, 0.9)) }),
         // Drawn after the water and the ford's gravel.
         ripple_mat: materials.add(StandardMaterial { depth_bias: 40.0, ..glow(Color::srgba(0.85, 0.95, 1.0, 0.3)) }),
     });
@@ -1765,17 +1767,31 @@ fn race_hazards(
             }
         }
 
-        if terrain.water_depth(pos) > 0.0 && car.vel.length() > 60.0 && rng.next_f32() < 0.8 {
-            let back = pos - car.forward() * car.model.size.x * 0.4;
-            let side = car.forward().perp() * rng.range(-1.0, 1.0) * car.model.size.y * 0.6;
-            let vel = -car.vel * 0.3 + car.forward().perp() * rng.range(-120.0, 120.0);
-            commands.spawn((
-                RoundEntity,
-                Spark { vel, life: rng.range(0.2, 0.45) },
-                Mesh3d(art.spark_mesh.clone()),
-                MeshMaterial3d(art.spray_mat.clone()),
-                Transform::from_translation((back + side).extend(tf.translation.z + 4.0)),
-            ));
+        // Splashing through water: droplets thrown up and out from the
+        // wheels, more the faster the car goes.
+        let speed = car.vel.length();
+        if let Some((level, _)) = terrain.water
+            && terrain.water_depth(pos) > 0.0
+            && speed > 40.0
+        {
+            let (fwd, left) = (car.forward(), car.forward().perp());
+            let half = car.model.size / 2.0;
+            let count = rng.range(0.0, speed / 50.0).round() as usize;
+            for _ in 0..count {
+                let side = if rng.next_f32() < 0.5 { -1.0 } else { 1.0 };
+                let along = if rng.next_f32() < 0.6 { 0.6 } else { -0.6 };
+                let wheel = pos + fwd * along * half.x + left * side * half.y;
+                let out = left * side * rng.range(40.0, 110.0) * (speed / 400.0).min(1.5);
+                let vel = (car.vel * rng.range(0.2, 0.5) + out).extend(rng.range(70.0, 150.0) * (speed / 400.0).clamp(0.5, 1.3));
+                commands.spawn((
+                    RoundEntity,
+                    Droplet { vel, level },
+                    Mesh3d(art.spark_mesh.clone()),
+                    MeshMaterial3d(art.spray_mat.clone()),
+                    Transform::from_translation(wheel.extend(level + 1.0)).with_scale(Vec3::splat(rng.range(0.5, 1.0))),
+                    bevy::light::NotShadowCaster,
+                ));
+            }
         }
 
         // Down in a ravine or the river, or landed beside the track: put the
@@ -1802,6 +1818,27 @@ fn race_hazards(
         racer.index = track.locate(at, None).index;
         racer.lateral = 0.0;
         sounds.play(Sfx::Crash, vol * 0.6);
+    }
+}
+
+/// A drop of water thrown up by a car; it falls back into the water.
+#[derive(Component)]
+struct Droplet {
+    vel: Vec3,
+    /// Water surface it lands back on.
+    level: f32,
+}
+
+fn update_droplets(mut commands: Commands, time: Res<Time>, mut q: Query<(Entity, &mut Transform, &mut Droplet)>) {
+    let dt = time.delta_secs();
+    for (e, mut tf, mut d) in &mut q {
+        d.vel.z -= FALL_GRAVITY * dt;
+        d.vel.x *= (-1.5 * dt).exp();
+        d.vel.y *= (-1.5 * dt).exp();
+        tf.translation += d.vel * dt;
+        if tf.translation.z < d.level {
+            commands.entity(e).despawn();
+        }
     }
 }
 
