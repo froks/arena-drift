@@ -1,8 +1,9 @@
-//! Arena Drift — a top-down demolition derby.
+//! Arena Drift — a top-down demolition derby and racer.
 //!
-//! Ram the other cars until you're the last one still running.
+//! Derby: ram the other cars until you're the last one still running.
 //! Front hits hurt the other car more than you; getting T-boned hurts most.
-//! Power-ups spawn around the arena: health packs, guns, rockets, mines and turbo.
+//! Race: a few laps against three rivals; first over the line wins.
+//! Power-ups spawn around the arena or track: health packs, guns, rockets, mines and turbo.
 
 use bevy::prelude::*;
 
@@ -13,10 +14,12 @@ mod minimap;
 mod physics;
 mod sound;
 mod terrain;
+mod track;
 
 use std::collections::VecDeque;
 
 use arena::{ARENAS, ArenaArt, ArenaDef, Explosive, Obstacle};
+use bevy::light::NotShadowCaster;
 use bevy::window::PrimaryWindow;
 use minimap::{Icon, MinimapPlugin};
 
@@ -25,6 +28,7 @@ use icons::IconArt;
 use physics::{Obb, cross};
 use sound::{Sfx, SoundPlugin, Sounds};
 use terrain::Terrain;
+use track::Track;
 
 // ---------------------------------------------------------------------------
 // Tuning
@@ -55,6 +59,10 @@ const DAMAGE_SCALE: f32 = 0.16;
 const WALL_DAMAGE_SCALE: f32 = 0.05;
 
 const AI_CARS: usize = 5;
+/// Cars in a race, the player included.
+const RACE_CARS: usize = 4;
+/// Seconds of "3, 2, 1" before a race starts.
+const COUNTDOWN: f32 = 3.0;
 
 // Power-ups
 const PICKUP_INTERVAL: f32 = 3.0;
@@ -96,6 +104,7 @@ const PICKUP_HOVER: f32 = 14.0;
 #[derive(States, Default, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum GameState {
     #[default]
+    Menu,
     Garage,
     Playing,
     GameOver,
@@ -211,6 +220,64 @@ struct Ai {
     /// Per-car personality: how much it prefers going after the player.
     player_bias: f32,
     aggression: f32,
+    /// Racing: where across the track it's aiming (offset from the centreline).
+    lane: f32,
+}
+
+impl Ai {
+    fn new(player_bias: f32, aggression: f32) -> Self {
+        Self { stuck: 0.0, reversing: 0.0, player_bias, aggression, lane: 0.0 }
+    }
+}
+
+/// A car's progress round a race track.
+#[derive(Component)]
+struct Racer {
+    /// Distance driven along the track since the start line (negative on
+    /// the grid; one lap is `track.length`).
+    progress: f32,
+    /// Nearest centreline sample, to speed up the next lookup.
+    index: usize,
+    /// Sideways offset from the centreline.
+    lateral: f32,
+    /// Race clock when the current lap started.
+    lap_start: f32,
+    best_lap: Option<f32>,
+    /// Race clock when it crossed the line for the last time.
+    finish: Option<f32>,
+}
+
+impl Racer {
+    /// Laps completed so far.
+    fn laps_done(&self, track: &Track) -> u32 {
+        (self.progress / track.length).floor().max(0.0) as u32
+    }
+}
+
+/// Race clock and start countdown. Only exists during races.
+#[derive(Resource)]
+struct Race {
+    countdown: f32,
+    clock: f32,
+}
+
+impl Race {
+    fn started(&self) -> bool {
+        self.countdown <= 0.0
+    }
+}
+
+#[derive(Component)]
+struct CountdownText;
+
+/// Floating health bar for a car.
+#[derive(Component)]
+struct HealthBar {
+    car: Entity,
+    fill: Entity,
+    fill_mat: Handle<StandardMaterial>,
+    dot: Entity,
+    dot_mat: Handle<StandardMaterial>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -310,6 +377,10 @@ struct Score {
     damage_dealt: f32,
     wrecks: u32,
     won: bool,
+    /// Races: where the player finished (1 = won), or `None` if they didn't.
+    place: Option<usize>,
+    race_time: Option<f32>,
+    best_lap: Option<f32>,
 }
 
 #[derive(Resource, Default)]
@@ -353,11 +424,13 @@ struct Sim {
     draws: u32,
     clock: f32,
     total_time: f32,
+    /// Cars in the current round.
+    field: Vec<usize>,
 }
 
 impl Sim {
     /// Models for this round: all of them, or one tier repeated to fill the grid.
-    fn lineup(&self) -> Vec<usize> {
+    fn lineup(&self, count: usize) -> Vec<usize> {
         let pool: Vec<usize> = match self.tier {
             Some(t) => cars::tier_models(t),
             None => (0..MODELS.len()).collect(),
@@ -365,7 +438,7 @@ impl Sim {
         // Offsetting by the round rotates both starting spots and which
         // models get doubled up when the pool is smaller than the grid.
         let r = self.round as usize;
-        (0..=AI_CARS).map(|i| pool[(i + r) % pool.len()]).collect()
+        (0..count).map(|i| pool[(i + r) % pool.len()]).collect()
     }
 }
 
@@ -390,6 +463,10 @@ struct Art {
     smoke_mat: Handle<StandardMaterial>,
     square: Handle<Mesh>,
     skid_mat: Handle<StandardMaterial>,
+    dot_mesh: Handle<Mesh>,
+    arrow_mesh: Handle<Mesh>,
+    bar_back_mat: Handle<StandardMaterial>,
+    white_mat: Handle<StandardMaterial>,
 }
 
 /// Tiny xorshift RNG so we don't need an extra crate.
@@ -425,6 +502,7 @@ fn main() {
         draws: 0,
         clock: 0.0,
         total_time: 0.0,
+        field: Vec::new(),
     });
     let arena = std::env::var("ARENA_DRIFT_ARENA").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
     let autostart = sim.is_some() || std::env::var_os("ARENA_DRIFT_AUTOSTART").is_some();
@@ -463,13 +541,16 @@ fn main() {
         .insert_resource(bevy::light::DirectionalLightShadowMap {
             size: if cfg!(target_arch = "wasm32") { 2048 } else { 4096 },
         })
-        // Dev shortcut: ARENA_DRIFT_AUTOSTART=1 skips the garage.
-        .insert_state(if autostart { GameState::Playing } else { GameState::Garage })
+        .init_resource::<MenuChoice>()
+        // Dev shortcut: ARENA_DRIFT_AUTOSTART=1 skips the menu and garage.
+        .insert_state(if autostart { GameState::Playing } else { GameState::Menu })
         .init_resource::<CarArt>()
         .init_resource::<IconArt>()
         .init_resource::<ArenaArt>()
         .add_systems(Startup, setup_world)
         .add_systems(Update, dev_screenshot)
+        .add_systems(OnEnter(GameState::Menu), setup_menu)
+        .add_systems(Update, menu_input.run_if(in_state(GameState::Menu)))
         .add_systems(OnEnter(GameState::Garage), setup_garage)
         .add_systems(Update, (garage_input, garage_animate).chain().run_if(in_state(GameState::Garage)))
         .add_systems(OnEnter(GameState::Playing), start_round)
@@ -479,9 +560,11 @@ fn main() {
                 (
                     player_input,
                     ai_drive,
+                    ai_race,
                     car_physics,
                     static_collisions,
                     car_collisions,
+                    track_progress.run_if(resource_exists::<Track>),
                     follow_terrain,
                     skid_marks,
                 )
@@ -496,6 +579,7 @@ fn main() {
                     spawn_pickups,
                     update_car_visuals,
                     update_hud,
+                    update_countdown,
                     check_round_end,
                 )
                     .chain(),
@@ -513,7 +597,7 @@ fn main() {
                 icons::pulse_pickup_glow,
                 cars::steer_front_wheels,
                 arena::fade_canopies,
-                draw_health_bars,
+                (attach_health_bars, update_health_bars).chain().after(follow_terrain),
                 camera_follow.after(follow_terrain),
             ),
         )
@@ -603,6 +687,11 @@ fn setup_world(
             depth_bias: 50.0,
             ..glow(Color::srgba(0.05, 0.05, 0.05, 0.35))
         }),
+        dot_mesh: meshes.add(Circle::new(1.0)),
+        // Points down, at the car below it.
+        arrow_mesh: meshes.add(Triangle2d::new(Vec2::new(0.0, -5.0), Vec2::new(6.0, 4.0), Vec2::new(-6.0, 4.0))),
+        bar_back_mat: materials.add(glow(Color::srgb(0.12, 0.03, 0.03))),
+        white_mat: materials.add(glow(Color::WHITE)),
     });
 }
 
@@ -633,7 +722,7 @@ fn start_round(
     mut arena_art: ResMut<ArenaArt>,
     mut skids: ResMut<SkidMarks>,
     current: Res<CurrentArena>,
-    sim: Option<Res<Sim>>,
+    mut sim: Option<ResMut<Sim>>,
     old: Query<Entity, With<RoundEntity>>,
 ) {
     for e in &old {
@@ -642,22 +731,40 @@ fn start_round(
     skids.0.clear();
     *score = Score::default();
     let def = current.def();
-    let (obstacles, ground) =
+    let (obstacles, ground, track) =
         arena::spawn_arena(&mut commands, &mut arena_art, &mut meshes, &mut images, &mut materials, def);
     *terrain = ground;
     minimap::spawn_minimap(&mut commands, def.size, RoundEntity);
+    let field = if track.is_some() { RACE_CARS } else { AI_CARS + 1 };
     // The player's car first, then rivals from the same tier.
-    let lineup = match &sim {
-        Some(sim) => sim.lineup(),
-        None => cars::tier_lineup(selected.0, AI_CARS),
+    let lineup = match &mut sim {
+        Some(sim) => {
+            sim.field = sim.lineup(field);
+            sim.field.clone()
+        }
+        None => cars::tier_lineup(selected.0, field - 1),
     };
     let paints = cars::lineup_paints(&lineup);
     pickup_timer.0 = 1.0; // first power-up shows up quickly
     blasts.0.clear();
 
-    // Fair starting grid: open road ahead of every car, no barrels next to anyone.
-    let total = lineup.len();
-    let (grid, _) = arena::spawn_points(&obstacles, def.size, total);
+    let grid = match &track {
+        // The player starts from the back of the grid.
+        Some(t) => {
+            let slots = t.grid(lineup.len());
+            let mut order: Vec<usize> = (0..lineup.len()).collect();
+            if sim.is_none() {
+                order.rotate_left(1);
+            }
+            let mut grid = vec![(Vec2::ZERO, 0.0); lineup.len()];
+            for (slot, &car) in order.iter().enumerate() {
+                grid[car] = slots[slot];
+            }
+            grid
+        }
+        // Fair starting spots: open road ahead of every car, no barrels next to anyone.
+        None => arena::spawn_points(&obstacles, def.size, lineup.len()).0,
+    };
     for (i, ((&model_index, &color), &(pos, heading))) in lineup.iter().zip(&paints).zip(&grid).enumerate() {
         let model = &MODELS[model_index];
         let paint = cars::new_paint(&mut materials, model, color);
@@ -678,19 +785,39 @@ fn start_round(
             size: Vec2::splat(if is_player { 110.0 } else { 80.0 }),
             layer: 3,
         });
+        if let Some(t) = &track {
+            let spot = t.locate(pos, None);
+            commands.entity(root).insert(Racer {
+                progress: t.delta(0.0, spot.s),
+                index: spot.index,
+                lateral: spot.lateral,
+                lap_start: 0.0,
+                best_lap: None,
+                finish: None,
+            });
+        }
 
-        if i == 0 && sim.is_none() {
+        let t = i as f32 / (field - 1) as f32;
+        if is_player {
             commands.entity(root).insert(Player);
         } else if sim.is_some() {
-            commands.entity(root).insert(Ai { stuck: 0.0, reversing: 0.0, player_bias: 1.0, aggression: 0.9 });
+            commands.entity(root).insert(Ai::new(1.0, 0.9));
+        } else if track.is_some() {
+            // Racers differ in how hard they push through corners.
+            commands.entity(root).insert(Ai::new(1.0, 0.86 + 0.08 * t));
         } else {
-            let t = i as f32 / AI_CARS as f32;
-            commands.entity(root).insert(Ai {
-                stuck: 0.0,
-                reversing: 0.0,
-                player_bias: 0.6 + 0.3 * t,
-                aggression: 0.75 + 0.25 * (1.0 - t),
-            });
+            commands.entity(root).insert(Ai::new(0.6 + 0.3 * t, 0.75 + 0.25 * (1.0 - t)));
+        }
+    }
+
+    match track {
+        Some(t) => {
+            commands.insert_resource(t);
+            commands.insert_resource(Race { countdown: COUNTDOWN, clock: 0.0 });
+        }
+        None => {
+            commands.remove_resource::<Track>();
+            commands.remove_resource::<Race>();
         }
     }
 
@@ -715,6 +842,132 @@ fn start_round(
             ..default()
         },
     ));
+    if def.is_race() {
+        commands.spawn((
+            RoundEntity,
+            Node {
+                position_type: PositionType::Absolute,
+                width: percent(100),
+                top: percent(30),
+                justify_content: JustifyContent::Center,
+                ..default()
+            },
+            children![(
+                CountdownText,
+                Text::new(""),
+                TextFont { font_size: FontSize::Px(110.0), ..default() },
+                TextColor(Color::srgb(0.95, 0.8, 0.3)),
+                TextShadow::default(),
+            )],
+        ));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Main menu
+// ---------------------------------------------------------------------------
+
+/// Which menu entry is highlighted: 0 = race, 1 = arena.
+#[derive(Resource, Default)]
+struct MenuChoice(usize);
+
+#[derive(Component)]
+struct MenuItem(usize);
+
+const MENU_ITEMS: [(&str, &str); 2] = [
+    ("NEW RACE", "Race three rivals. First over the line wins."),
+    ("ARENA", "Demolition derby. Last car running wins."),
+];
+
+fn setup_menu(mut commands: Commands, mut terrain: ResMut<Terrain>, old: Query<Entity, With<RoundEntity>>) {
+    for e in &old {
+        commands.entity(e).despawn();
+    }
+    *terrain = Terrain::default();
+    commands.remove_resource::<Track>();
+    commands.remove_resource::<Race>();
+
+    let gold = Color::srgb(0.95, 0.8, 0.3);
+    commands
+        .spawn((
+            DespawnOnExit(GameState::Menu),
+            Node {
+                width: percent(100),
+                height: percent(100),
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::Center,
+                row_gap: px(18),
+                ..default()
+            },
+        ))
+        .with_children(|root| {
+            root.spawn((
+                Text::new("ARENA DRIFT"),
+                TextFont { font_size: FontSize::Px(76.0), ..default() },
+                TextColor(gold),
+                Node { margin: UiRect::bottom(px(30)), ..default() },
+            ));
+            for (i, (title, blurb)) in MENU_ITEMS.iter().enumerate() {
+                root.spawn((
+                    MenuItem(i),
+                    Node {
+                        width: px(520),
+                        flex_direction: FlexDirection::Column,
+                        align_items: AlignItems::Center,
+                        padding: UiRect::all(px(14)),
+                        border: UiRect::all(px(3)),
+                        ..default()
+                    },
+                    BorderColor::all(Color::NONE),
+                    BackgroundColor(Color::srgba(1.0, 1.0, 1.0, 0.04)),
+                    children![
+                        (Text::new(*title), TextFont { font_size: FontSize::Px(40.0), ..default() }, TextColor(Color::WHITE)),
+                        (
+                            Text::new(*blurb),
+                            TextFont { font_size: FontSize::Px(18.0), ..default() },
+                            TextColor(Color::srgb(0.7, 0.7, 0.7)),
+                            TextLayout::justify(Justify::Center),
+                        ),
+                    ],
+                ));
+            }
+            root.spawn((
+                Text::new("Up/Down choose  |  Enter select"),
+                TextFont { font_size: FontSize::Px(20.0), ..default() },
+                TextColor(Color::srgb(0.6, 0.6, 0.6)),
+                Node { margin: UiRect::top(px(30)), ..default() },
+            ));
+        });
+}
+
+fn menu_input(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut choice: ResMut<MenuChoice>,
+    mut current: ResMut<CurrentArena>,
+    mut next: ResMut<NextState<GameState>>,
+    mut items: Query<(&MenuItem, &mut BorderColor, &mut BackgroundColor)>,
+) {
+    let n = MENU_ITEMS.len();
+    if keys.any_just_pressed([KeyCode::ArrowUp, KeyCode::KeyW]) {
+        choice.0 = (choice.0 + n - 1) % n;
+    }
+    if keys.any_just_pressed([KeyCode::ArrowDown, KeyCode::KeyS, KeyCode::Tab]) {
+        choice.0 = (choice.0 + 1) % n;
+    }
+    for (item, mut border, mut bg) in &mut items {
+        let on = item.0 == choice.0;
+        *border = BorderColor::all(if on { Color::srgb(0.95, 0.8, 0.3) } else { Color::NONE });
+        bg.0 = Color::srgba(1.0, 1.0, 1.0, if on { 0.12 } else { 0.04 });
+    }
+    if keys.any_just_pressed([KeyCode::Enter, KeyCode::Space]) {
+        // Keep the last arena or track of that kind, if there was one.
+        let race = choice.0 == 0;
+        if current.def().is_race() != race {
+            current.0 = arena::arenas_for(race)[0];
+        }
+        next.set(GameState::Garage);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -824,7 +1077,13 @@ fn garage_input(
     mut info: Query<&mut Text, With<GarageInfo>>,
 ) {
     if keys.just_pressed(KeyCode::Tab) {
-        current.0 = (current.0 + 1) % ARENAS.len();
+        // Next arena or track of the same kind.
+        let pool = arena::arenas_for(current.def().is_race());
+        let k = pool.iter().position(|&i| i == current.0).unwrap_or(0);
+        current.0 = pool[(k + 1) % pool.len()];
+    }
+    if keys.just_pressed(KeyCode::Escape) {
+        next.set(GameState::Menu);
     }
     // Left/Right: car within the tier. Up/Down: tier (keeping the column).
     let tiers = cars::tiers();
@@ -848,7 +1107,7 @@ fn garage_input(
         let row = cars::tier_models(tiers[t]);
         selected.0 = row[col.min(row.len() - 1)];
     }
-    if keys.just_pressed(KeyCode::Enter) {
+    if keys.any_just_pressed([KeyCode::Enter, KeyCode::Space]) {
         next.set(GameState::Playing);
     }
 
@@ -856,21 +1115,25 @@ fn garage_input(
     let m = &MODELS[selected.0];
     let handling = |m: &CarModel| m.turn_rate * 0.6 + m.grip * 0.4;
     let toughness = |m: &CarModel| m.max_hp * m.armor;
+    let def = current.def();
+    let venue = match def.track() {
+        Some(t) => format!("Track: {} ({} laps)", def.name.to_uppercase(), t.laps),
+        None => format!("Arena: {}", def.name.to_uppercase()),
+    };
     text.0 = format!(
-        "TIER {}   <  {}  >\n{}\nRivals: {}\n\nArena: {} ({:?})  -  Tab to change\n{}\n\n\
+        "TIER {}   <  {}  >\n{}\nRivals: {}\n\n{}  -  Tab to change\n{}\n\n\
          Top speed  {}\n\
          Accel      {}\n\
          Handling   {}\n\
          Toughness  {}\n\
          Weight     {}\n\n\
-         Up/Down tier  |  Left/Right car  |  Enter race",
+         Up/Down tier  |  Left/Right car  |  Enter/Space start  |  Esc menu",
         m.tier,
         m.name.to_uppercase(),
         m.blurb,
         cars::tier_models(m.tier).iter().map(|&i| MODELS[i].name).collect::<Vec<_>>().join(", "),
-        current.def().name.to_uppercase(),
-        current.def().mode,
-        current.def().blurb,
+        venue,
+        def.blurb,
         stat_bar(m.top_speed, |m| m.top_speed),
         stat_bar(m.engine, |m| m.engine),
         stat_bar(handling(m), handling),
@@ -938,19 +1201,30 @@ fn player_input(
     car.throttle = throttle;
     car.steer = steer;
     car.handbrake = keys.pressed(KeyCode::Space);
-    // Left Ctrl fires only in native builds: in the browser, Ctrl+W (with W held for
-    // throttle) closes the tab, and pages are not allowed to prevent that shortcut.
-    armory.fire = keys.any_pressed([KeyCode::KeyF, KeyCode::KeyC, KeyCode::KeyV])
-        || (cfg!(not(target_arch = "wasm32")) && keys.pressed(KeyCode::ControlLeft));
+    // Ctrl suits arrow-key driving. In the browser, Ctrl+W (W held for throttle)
+    // would close the tab; pages can't block that, so index.html asks before
+    // leaving instead.
+    armory.fire = keys.any_pressed([
+        KeyCode::KeyF,
+        KeyCode::KeyC,
+        KeyCode::KeyV,
+        KeyCode::ControlLeft,
+        KeyCode::ControlRight,
+    ]);
 }
 
+/// Derby AI: hunt the other cars, grab power-ups on the way.
 fn ai_drive(
     time: Res<Time>,
+    track: Option<Res<Track>>,
     mut ais: Query<(Entity, &Transform, &mut Car, &mut Ai, &mut Armory)>,
     targets: Query<(Entity, &Transform, &Car, Has<Player>), Without<Ai>>,
     pickups: Query<(&Transform, &Pickup)>,
     obstacles: Query<&Obstacle>,
 ) {
+    if track.is_some() {
+        return; // racing: see `ai_race`
+    }
     let dt = time.delta_secs();
 
     // Snapshot every live car so AIs can target each other too.
@@ -1079,8 +1353,254 @@ fn ai_drive(
     }
 }
 
-fn car_physics(time: Res<Time>, terrain: Res<Terrain>, mut q: Query<(&mut Transform, &mut Car, &mut Armory)>) {
+/// Back up and turn when barely moving for a while. Returns true while backing up.
+fn ai_unstick(ai: &mut Ai, car: &mut Car, dt: f32, turn_towards: f32) -> bool {
+    if ai.reversing > 0.0 {
+        ai.reversing -= dt;
+        car.throttle = -1.0;
+        // Steering flips in reverse: this swings the nose towards the goal.
+        car.steer = -turn_towards.signum();
+        car.handbrake = false;
+        return true;
+    }
+    if car.vel.length() < 25.0 {
+        ai.stuck += dt;
+    } else {
+        ai.stuck = 0.0;
+    }
+    if ai.stuck > 1.2 {
+        ai.stuck = 0.0;
+        ai.reversing = 0.7;
+    }
+    false
+}
+
+/// How fast a car can take a bend of curvature `bend` (1 / radius).
+fn corner_speed(model: &CarModel, bend: f32, skill: f32) -> f32 {
+    skill * 0.8 * model.turn_rate / bend.max(1e-4)
+}
+
+/// Race AI: follow the track as fast as the corners allow, overtake, pick up
+/// power-ups near the racing line and shoot whoever is in front.
+#[allow(clippy::type_complexity)]
+fn ai_race(
+    time: Res<Time>,
+    track: Option<Res<Track>>,
+    race: Option<Res<Race>>,
+    mut ais: Query<(Entity, &Transform, &mut Car, &mut Ai, &mut Armory, &Racer)>,
+    others: Query<(Entity, &Transform, &Car, &Racer), Without<Ai>>,
+    pickups: Query<(&Transform, &Pickup)>,
+) {
+    let (Some(track), Some(race)) = (track, race) else { return };
     let dt = time.delta_secs();
+    let half = track.width / 2.0;
+
+    // Every car, wrecks included: (entity, position, progress, lateral, alive).
+    let mut field: Vec<(Entity, Vec2, f32, f32, bool)> = others
+        .iter()
+        .map(|(e, t, c, r)| (e, t.translation.truncate(), r.progress, r.lateral, c.alive()))
+        .collect();
+    field.extend(
+        ais.iter().map(|(e, t, c, _, _, r)| (e, t.translation.truncate(), r.progress, r.lateral, c.alive())),
+    );
+    let pickups: Vec<(Vec2, PickupKind)> = pickups.iter().map(|(t, p)| (t.translation.truncate(), p.0)).collect();
+
+    for (me, tf, mut car, mut ai, mut armory, racer) in &mut ais {
+        armory.fire = false;
+        if !car.alive() || !race.started() || racer.finish.is_some() {
+            // Finished cars cruise on, gently.
+            car.throttle = if racer.finish.is_some() && car.alive() { 0.3 } else { 0.0 };
+            car.handbrake = false;
+            if racer.finish.is_none() {
+                continue;
+            }
+        }
+        let pos = tf.translation.truncate();
+        let fwd = car.forward();
+        let speed = car.vel.length();
+        let s = racer.progress;
+
+        // Lane: cut to the inside of the next bend...
+        let look = 110.0 + speed * 0.4;
+        let bend_ahead = (1..=4)
+            .map(|k| {
+                let d = look * 0.5 * k as f32;
+                let i = ((s + d).rem_euclid(track.length) / track.step()) as usize;
+                track.sample(i).2
+            })
+            .fold(0.0_f32, |a, b| if b.abs() > a.abs() { b } else { a });
+        let mut lane = (bend_ahead * 160.0).clamp(-0.5, 0.5) * half;
+        // ...detour for a power-up if it's near the line ahead and useful...
+        let want = |k: PickupKind| match k {
+            PickupKind::Health => car.health() < 0.6,
+            PickupKind::Turbo => true,
+            _ => armory.weapon == Weapon::None,
+        };
+        for &(p, kind) in &pickups {
+            let rel = p - pos;
+            if want(kind) && fwd.dot(rel) > 60.0 && rel.length() < 420.0 {
+                let spot = track.locate(p, Some(racer.index));
+                if (spot.lateral - lane).abs() < half * 0.7 {
+                    lane = spot.lateral;
+                    break;
+                }
+            }
+        }
+        // ...and go round a slower car (or a wreck) in the way. Progress
+        // wraps per lap, so compare positions on the track, not laps.
+        for &(e, _, other_s, other_lat, _) in &field {
+            let gap = track.delta(s.rem_euclid(track.length), other_s.rem_euclid(track.length));
+            if e != me && gap > 0.0 && gap < 150.0 && (other_lat - lane).abs() < 50.0 {
+                let room_left = half - other_lat;
+                let room_right = other_lat + half;
+                lane = if room_left > room_right { other_lat + 60.0 } else { other_lat - 60.0 };
+            }
+        }
+        let lane = lane.clamp(-half + 40.0, half - 40.0);
+        ai.lane += (lane - ai.lane) * (1.0 - (-3.0 * dt).exp());
+
+        let aim_s = s + look;
+        let target = track.point_at(aim_s) + track.dir_at(aim_s).perp() * ai.lane;
+        let diff = fwd.angle_to(target - pos);
+        if ai_unstick(&mut ai, &mut car, dt, diff) {
+            continue;
+        }
+        if racer.finish.is_some() {
+            car.steer = (diff * 3.0).clamp(-1.0, 1.0);
+            continue;
+        }
+
+        // Fastest speed that still makes every bend coming up, given room to brake.
+        let brake = 650.0;
+        let allowed = (0..16)
+            .map(|k| {
+                let d = 20.0 + 40.0 * k as f32;
+                let v = corner_speed(car.model, track.curvature_at(s + d), ai.aggression);
+                (v * v + 2.0 * brake * d).sqrt()
+            })
+            .fold(f32::MAX, f32::min);
+        car.steer = (diff * 3.0).clamp(-1.0, 1.0);
+        car.throttle = if diff.abs() > 1.4 {
+            0.6 // pointing the wrong way: turn round
+        } else if speed > allowed + 25.0 {
+            -1.0
+        } else if speed > allowed {
+            0.2
+        } else {
+            1.0
+        };
+        car.handbrake = diff.abs() > 1.0 && speed > 220.0;
+
+        // Shoot at whoever is in front, drop mines on whoever is behind.
+        let in_sights = |max: f32, cone: f32| {
+            field.iter().any(|&(e, p, _, _, alive)| {
+                let rel = p - pos;
+                alive && e != me && rel.length() < max && rel.length() > 30.0 && fwd.angle_to(rel).abs() < cone
+            })
+        };
+        armory.fire = match armory.weapon {
+            Weapon::None => false,
+            Weapon::Guns => in_sights(500.0, 0.2),
+            Weapon::Rockets => in_sights(800.0, 0.1),
+            Weapon::Mines => field.iter().any(|&(e, p, _, _, alive)| {
+                let rel = p - pos;
+                alive && e != me && rel.length() < 250.0 && fwd.dot(rel.normalize_or_zero()) < -0.7
+            }),
+        };
+    }
+}
+
+/// Track every car's progress round the circuit: laps, lap times, finish.
+fn track_progress(
+    time: Res<Time>,
+    track: Res<Track>,
+    mut race: ResMut<Race>,
+    mut sounds: ResMut<Sounds>,
+    mut cars: Query<(&Transform, &Car, &mut Racer, Has<Player>)>,
+) {
+    let dt = time.delta_secs();
+    if !race.started() {
+        let before = race.countdown.ceil();
+        race.countdown -= dt;
+        if race.countdown <= 0.0 {
+            sounds.play(Sfx::Go, 0.8);
+        } else if race.countdown.ceil() < before {
+            sounds.play(Sfx::Beep, 0.7);
+        }
+        return;
+    }
+    race.clock += dt;
+    let full = track.length * track.laps as f32;
+    for (tf, car, mut racer, is_player) in &mut cars {
+        let spot = track.locate(tf.translation.truncate(), Some(racer.index));
+        let laps_before = racer.laps_done(&track);
+        let s_before = racer.progress.rem_euclid(track.length);
+        racer.progress += track.delta(s_before, spot.s);
+        racer.index = spot.index;
+        racer.lateral = spot.lateral;
+        if racer.finish.is_some() || !car.alive() {
+            continue;
+        }
+        if racer.laps_done(&track) > laps_before {
+            let lap = race.clock - racer.lap_start;
+            racer.best_lap = Some(racer.best_lap.map_or(lap, |b| b.min(lap)));
+            racer.lap_start = race.clock;
+            if is_player && racer.progress < full {
+                sounds.play(Sfx::Beep, 0.5);
+            }
+        }
+        if racer.progress >= full {
+            racer.finish = Some(race.clock);
+        }
+    }
+}
+
+/// Finishing order so far: finished cars by time, then running cars by
+/// distance, then wrecks.
+fn race_order<'a>(racers: impl Iterator<Item = (Entity, &'a Car, &'a Racer)>) -> Vec<Entity> {
+    let mut v: Vec<(Entity, &Car, &Racer)> = racers.collect();
+    let key = |c: &Car, r: &Racer| match r.finish {
+        Some(t) => (0, t),
+        None if c.alive() => (1, -r.progress),
+        None => (2, -r.progress),
+    };
+    v.sort_by(|a, b| {
+        let (ka, kb) = (key(a.1, a.2), key(b.1, b.2));
+        ka.0.cmp(&kb.0).then(ka.1.total_cmp(&kb.1))
+    });
+    v.into_iter().map(|(e, ..)| e).collect()
+}
+
+fn update_countdown(race: Option<Res<Race>>, mut text: Query<&mut Text, With<CountdownText>>) {
+    let (Some(race), Ok(mut text)) = (race, text.single_mut()) else { return };
+    let want = if !race.started() {
+        format!("{}", race.countdown.ceil() as i32)
+    } else if race.clock < 0.8 {
+        "GO!".to_string()
+    } else {
+        String::new()
+    };
+    if text.0 != want {
+        text.0 = want;
+    }
+}
+
+fn car_physics(
+    time: Res<Time>,
+    terrain: Res<Terrain>,
+    race: Option<Res<Race>>,
+    mut q: Query<(&mut Transform, &mut Car, &mut Armory)>,
+) {
+    let dt = time.delta_secs();
+    // Everyone waits on the grid during the countdown.
+    if race.is_some_and(|r| !r.started()) {
+        for (_, mut car, mut armory) in &mut q {
+            car.vel = Vec2::ZERO;
+            car.spin = 0.0;
+            armory.fire = false;
+        }
+        return;
+    }
     for (mut tf, mut car, mut armory) in &mut q {
         let m = car.model;
         // Slopes pull everything downhill: valleys collect wrecks.
@@ -1609,6 +2129,7 @@ fn spawn_pickups(
     obstacles: Query<&Obstacle>,
     current: Res<CurrentArena>,
     terrain: Res<Terrain>,
+    track: Option<Res<Track>>,
 ) {
     timer.0 -= time.delta_secs();
     if timer.0 > 0.0 {
@@ -1636,7 +2157,15 @@ fn spawn_pickups(
     let margin = current.def().size / 2.0 - Vec2::splat(80.0);
     let mut pos = Vec2::ZERO;
     for _ in 0..30 {
-        pos = Vec2::new(rng.range(-margin.x, margin.x), rng.range(-margin.y, margin.y));
+        pos = match &track {
+            // Somewhere on the track, away from the start.
+            Some(t) => {
+                let s = rng.range(250.0, t.length - 350.0);
+                let side = rng.range(-1.0, 1.0) * (t.width / 2.0 - 45.0);
+                t.point_at(s) + t.dir_at(s).perp() * side
+            }
+            None => Vec2::new(rng.range(-margin.x, margin.x), rng.range(-margin.y, margin.y)),
+        };
         let clear_of_cars = cars.iter().all(|t| t.translation.truncate().distance(pos) > 90.0);
         if clear_of_cars && obstacles.iter().all(|o| o.distance(pos) > 40.0) {
             break;
@@ -1789,41 +2318,108 @@ fn update_car_visuals(
     }
 }
 
-fn draw_health_bars(mut gizmos: Gizmos, time: Res<Time>, q: Query<(&Transform, &Car, &Armory, Has<Player>)>) {
-    for (tf, car, armory, is_player) in &q {
-        if !car.alive() {
+const BAR_WIDTH: f32 = 44.0;
+
+/// Give every new car a floating health bar (plus an arrow for the player).
+fn attach_health_bars(
+    mut commands: Commands,
+    art: Res<Art>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    cars: Query<(Entity, Has<Player>), Added<Car>>,
+) {
+    for (car, is_player) in &cars {
+        let flat = |m: &Handle<Mesh>, mat: &Handle<StandardMaterial>, at: Vec3, scale: Vec3| {
+            (
+                Mesh3d(m.clone()),
+                MeshMaterial3d(mat.clone()),
+                Transform::from_translation(at).with_scale(scale),
+                NotShadowCaster,
+            )
+        };
+        let unlit = |c: Color| StandardMaterial { base_color: c, unlit: true, ..default() };
+        let fill_mat = materials.add(unlit(Color::srgb(0.2, 0.9, 0.2)));
+        let dot_mat = materials.add(unlit(Color::WHITE));
+        let fill = commands.spawn(flat(&art.square, &fill_mat, Vec3::new(0.0, 0.0, 0.5), Vec3::new(BAR_WIDTH - 4.0, 3.5, 1.0))).id();
+        let dot = commands.spawn(flat(&art.dot_mesh, &dot_mat, Vec3::new(BAR_WIDTH / 2.0 + 7.0, 0.0, 0.5), Vec3::splat(4.5))).id();
+        let back = commands.spawn(flat(&art.square, &art.bar_back_mat, Vec3::ZERO, Vec3::new(BAR_WIDTH, 7.5, 1.0))).id();
+        let mut parts = vec![back, fill, dot];
+        if is_player {
+            let arrow = flat(&art.arrow_mesh, &art.white_mat, Vec3::new(0.0, 13.0, 0.5), Vec3::ONE);
+            parts.push(commands.spawn((arrow, PlayerArrow)).id());
+        }
+        commands
+            .spawn((RoundEntity, HealthBar { car, fill, fill_mat, dot, dot_mat }, Transform::default(), Visibility::default()))
+            .add_children(&parts);
+    }
+}
+
+/// Bobbing arrow over the player's health bar.
+#[derive(Component)]
+struct PlayerArrow;
+
+/// Keep each health bar over its car, showing health and the weapon carried.
+#[allow(clippy::type_complexity)]
+fn update_health_bars(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut bars: Query<(Entity, &HealthBar, &mut Transform, &mut Visibility)>,
+    cars: Query<(&Transform, &Car, &Armory), Without<HealthBar>>,
+    mut parts: Query<(&mut Transform, &mut Visibility), (Without<HealthBar>, Without<Car>)>,
+    arrows: Query<Entity, With<PlayerArrow>>,
+) {
+    for (entity, bar, mut tf, mut vis) in &mut bars {
+        let Ok((car_tf, car, armory)) = cars.get(bar.car) else {
+            commands.entity(entity).despawn();
+            continue;
+        };
+        let show = car.alive();
+        let want = if show { Visibility::Inherited } else { Visibility::Hidden };
+        if *vis != want {
+            *vis = want;
+        }
+        if !show {
             continue;
         }
-        let health = car.health();
-        // Floats just above the roof, behind the car on screen.
-        let left = tf.translation
-            + Vec3::new(-20.0, car.model.size.x * 0.5 + 10.0, cars::roof_height(car.model) + 8.0);
-        let line = |gizmos: &mut Gizmos, a: Vec2, b: Vec2, c: Color| {
-            gizmos.line(left + a.extend(0.0), left + b.extend(0.0), c);
-        };
-        line(&mut gizmos, Vec2::ZERO, Vec2::X * 40.0, Color::srgb(0.3, 0.05, 0.05));
-        let bar = Color::srgb(1.0 - health, health, 0.15);
-        line(&mut gizmos, Vec2::ZERO, Vec2::X * 40.0 * health, bar);
+        // Floats over the roof, just above the car on screen.
+        tf.translation = car_tf.translation + Vec3::new(0.0, car.model.size.x * 0.5 + 12.0, cars::roof_height(car.model) + 14.0);
 
-        // A small coloured dot shows what weapon a car is carrying.
-        let weapon_color = match armory.weapon {
+        let health = car.health();
+        if let Ok((mut ftf, _)) = parts.get_mut(bar.fill) {
+            let w = (BAR_WIDTH - 4.0) * health;
+            ftf.scale.x = w.max(0.01);
+            ftf.translation.x = -(BAR_WIDTH - 4.0) / 2.0 + w / 2.0;
+        }
+        let color = Color::srgb((1.0 - health) * 1.6, health * 1.2, 0.15);
+        if let Some(mut m) = materials.get_mut(&bar.fill_mat)
+            && m.base_color != color
+        {
+            m.base_color = color;
+        }
+
+        let weapon = match armory.weapon {
             Weapon::None => None,
             Weapon::Guns => Some(PickupKind::Guns.color()),
             Weapon::Rockets => Some(PickupKind::Rockets.color()),
             Weapon::Mines => Some(PickupKind::Mines.color()),
         };
-        if let Some(c) = weapon_color {
-            gizmos.circle(Isometry3d::from_translation(left + Vec3::new(48.0, 0.0, 0.0)), 4.0, c);
+        if let Ok((_, mut dvis)) = parts.get_mut(bar.dot) {
+            let want = if weapon.is_some() { Visibility::Inherited } else { Visibility::Hidden };
+            if *dvis != want {
+                *dvis = want;
+            }
         }
-
-        // Bobbing arrow above the player's car.
-        if is_player {
-            let bob = (time.elapsed_secs() * 5.0).sin() * 2.0;
-            let tip = Vec2::new(20.0, 8.0 + bob);
-            let white = Color::srgb(1.0, 1.0, 1.0);
-            line(&mut gizmos, tip, tip + Vec2::new(-6.0, 7.0), white);
-            line(&mut gizmos, tip, tip + Vec2::new(6.0, 7.0), white);
-            line(&mut gizmos, tip + Vec2::new(-6.0, 7.0), tip + Vec2::new(6.0, 7.0), white);
+        if let Some(c) = weapon
+            && let Some(mut m) = materials.get_mut(&bar.dot_mat)
+            && m.base_color != c
+        {
+            m.base_color = c;
+        }
+    }
+    let bob = (time.elapsed_secs() * 5.0).sin() * 2.0;
+    for arrow in &arrows {
+        if let Ok((mut atf, _)) = parts.get_mut(arrow) {
+            atf.translation.y = 13.0 + bob;
         }
     }
 }
@@ -1905,7 +2501,8 @@ fn camera_follow(
     let mut tf = camera.into_inner();
     let view = Vec2::new(window.width(), window.height()).max(Vec2::ONE);
 
-    let (target, target_zoom, target_ground, snap) = if *state.get() == GameState::Garage {
+    let showroom = matches!(state.get(), GameState::Garage | GameState::Menu);
+    let (target, target_zoom, target_ground, snap) = if showroom {
         // The showroom is laid out for 1280x800; fit it to whatever the window is.
         let fit = (Vec2::new(1280.0, 800.0) / view).max_element().max(1.0);
         (Vec2::new(0.0, 24.0), fit, 0.0, true)
@@ -1931,7 +2528,7 @@ fn camera_follow(
     let mut pos = tf.translation.truncate();
     pos += (target - pos) * k;
 
-    if *state.get() != GameState::Garage {
+    if !showroom {
         // Don't show more than a strip of the outfield.
         let arena = current.def().size;
         let room = arena / 2.0 + Vec2::splat(160.0) - view / 2.0 * *z;
@@ -1951,14 +2548,20 @@ fn camera_follow(
     }
 }
 
+fn race_time(t: f32) -> String {
+    format!("{}:{:04.1}", (t / 60.0) as u32, t % 60.0)
+}
+
+#[allow(clippy::type_complexity)]
 fn update_hud(
     score: Res<Score>,
-    cars: Query<(&Car, &Armory, Has<Player>)>,
+    track: Option<Res<Track>>,
+    race: Option<Res<Race>>,
+    cars: Query<(Entity, &Car, &Armory, Has<Player>, Option<&Racer>)>,
     mut hud: Query<&mut Text, With<Hud>>,
 ) {
     let Ok(mut text) = hud.single_mut() else { return };
-    let Some((car, armory, _)) = cars.iter().find(|(_, _, p)| *p) else { return };
-    let rivals = cars.iter().filter(|(c, _, p)| !p && c.alive()).count();
+    let Some((player, car, armory, _, racer)) = cars.iter().find(|(.., p, _)| *p) else { return };
 
     let weapon_text = if armory.weapon == Weapon::None {
         armory.weapon.name().to_string()
@@ -1966,18 +2569,36 @@ fn update_hud(
         format!("{} x{}", armory.weapon.name(), armory.ammo)
     };
     let turbo_text = if armory.turbo > 0.0 { format!("   TURBO {:.1}s", armory.turbo) } else { String::new() };
+    let status = match (&track, &race, racer) {
+        (Some(track), Some(race), Some(racer)) => {
+            let order = race_order(cars.iter().filter_map(|(e, c, _, _, r)| r.map(|r| (e, c, r))));
+            let place = order.iter().position(|&e| e == player).unwrap_or(0) + 1;
+            let lap = (racer.laps_done(track) + 1).min(track.laps);
+            let best = racer.best_lap.map_or("-".to_string(), race_time);
+            format!(
+                "POS {place}/{}   LAP {lap}/{}   TIME {}   BEST {best}",
+                order.len(),
+                track.laps,
+                race_time(race.clock),
+            )
+        }
+        _ => format!(
+            "Rivals {}   Wrecked {}   Score {:.0}",
+            cars.iter().filter(|(_, c, _, p, _)| !p && c.alive()).count(),
+            score.wrecks,
+            total_score(&score)
+        ),
+    };
 
     text.0 = format!(
-        "{}  HP {:>3.0}/{:.0}   Weapon {}{}   Rivals {}   Wrecked {}   Score {:.0}\n\
-         W/S throttle  |  A/D steer  |  Space handbrake  |  F/C/V fire",
+        "{}  HP {:>3.0}/{:.0}   Weapon {}{}   {}\n\
+         W/S or arrows drive  |  Space handbrake  |  Ctrl or F/C/V fire",
         car.model.name,
         car.hp.max(0.0),
         car.model.max_hp,
         weapon_text,
         turbo_text,
-        rivals,
-        score.wrecks,
-        total_score(&score),
+        status,
     );
 }
 
@@ -1989,23 +2610,38 @@ fn total_score(score: &Score) -> f32 {
 // Round flow
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn check_round_end(
     time: Res<Time>,
-    cars: Query<(&Car, Has<Player>)>,
+    cars: Query<(Entity, &Car, Has<Player>)>,
+    racers: Query<(Entity, &Car, &Racer)>,
+    track: Option<Res<Track>>,
+    race: Option<Res<Race>>,
     mut score: ResMut<Score>,
     mut next: ResMut<NextState<GameState>>,
     sim: Option<ResMut<Sim>>,
 ) {
+    let racing = track.is_some() && race.is_some();
     if let Some(mut sim) = sim {
         sim.clock += time.delta_secs();
-        let alive: Vec<&Car> = cars.iter().map(|(c, _)| c).filter(|c| c.alive()).collect();
-        if alive.len() > 1 && sim.clock < SIM_ROUND_LIMIT {
+        let alive: Vec<&Car> = cars.iter().map(|(_, c, _)| c).filter(|c| c.alive()).collect();
+        let over = if racing {
+            racers.iter().all(|(_, c, r)| r.finish.is_some() || !c.alive())
+        } else {
+            alive.len() <= 1
+        };
+        if !over && sim.clock < SIM_ROUND_LIMIT {
             return;
         }
-        for m in sim.lineup() {
+        for m in sim.field.clone() {
             sim.entries[m] += 1;
         }
-        let winner = (alive.len() == 1).then(|| alive[0].model);
+        let winner = if racing {
+            let order = race_order(racers.iter());
+            racers.get(order[0]).ok().filter(|(_, _, r)| r.finish.is_some()).map(|(_, c, _)| c.model)
+        } else {
+            (alive.len() == 1).then(|| alive[0].model)
+        };
         match winner.and_then(|w| MODELS.iter().position(|m| std::ptr::eq(m, w))) {
             Some(i) => sim.wins[i] += 1,
             None => sim.draws += 1,
@@ -2019,29 +2655,84 @@ fn check_round_end(
             winner.map_or("draw", |m| m.name),
             sim.clock
         );
+        if racing {
+            for e in race_order(racers.iter()) {
+                let (_, c, r) = racers.get(e).unwrap();
+                let result = match r.finish {
+                    Some(t) => race_time(t),
+                    None if c.alive() => format!("{:.1} laps", r.progress / track.as_ref().unwrap().length),
+                    None => "wrecked".to_string(),
+                };
+                eprintln!("SIM     {:<11} {:>10}  best lap {}", c.model.name, result, r.best_lap.map_or("-".into(), race_time));
+            }
+        }
         sim.clock = 0.0;
         next.set(GameState::GameOver);
         return;
     }
 
-    let player_alive = cars.iter().any(|(c, p)| p && c.alive());
-    let rivals = cars.iter().filter(|(c, p)| !p && c.alive()).count();
+    if racing {
+        let Some((player, car, racer)) = racers.iter().find(|(e, ..)| cars.get(*e).is_ok_and(|c| c.2)) else { return };
+        if racer.finish.is_some() || !car.alive() {
+            let order = race_order(racers.iter());
+            score.place = racer.finish.and(order.iter().position(|&e| e == player).map(|p| p + 1));
+            score.race_time = racer.finish;
+            score.best_lap = racer.best_lap;
+            score.won = score.place == Some(1);
+            next.set(GameState::GameOver);
+        }
+        return;
+    }
+
+    let player_alive = cars.iter().any(|(_, c, p)| p && c.alive());
+    let rivals = cars.iter().filter(|(_, c, p)| !p && c.alive()).count();
     if !player_alive || rivals == 0 {
         score.won = player_alive;
         next.set(GameState::GameOver);
     }
 }
 
-fn show_game_over(mut commands: Commands, score: Res<Score>, mut sounds: ResMut<Sounds>, sim: Option<Res<Sim>>) {
+fn ordinal(n: usize) -> String {
+    let suffix = match (n % 10, n % 100) {
+        (1, 11) | (2, 12) | (3, 13) => "th",
+        (1, _) => "st",
+        (2, _) => "nd",
+        (3, _) => "rd",
+        _ => "th",
+    };
+    format!("{n}{suffix}")
+}
+
+fn show_game_over(
+    mut commands: Commands,
+    score: Res<Score>,
+    mut sounds: ResMut<Sounds>,
+    sim: Option<Res<Sim>>,
+    race: Option<Res<Race>>,
+) {
     if sim.is_some() {
         return;
     }
-    sounds.play(if score.won { Sfx::Win } else { Sfx::Lose }, 0.8);
-    let (headline, color) = if score.won {
-        ("LAST CAR RUNNING!", Color::srgb(0.4, 1.0, 0.5))
-    } else {
-        ("WRECKED", Color::srgb(1.0, 0.35, 0.3))
+    let (green, red) = (Color::srgb(0.4, 1.0, 0.5), Color::srgb(1.0, 0.35, 0.3));
+    let (headline, color, details) = match (race.is_some(), score.place) {
+        (true, Some(place)) => (
+            if place == 1 { "YOU WIN!".to_string() } else { format!("FINISHED {}", ordinal(place)) },
+            if place == 1 { green } else { Color::srgb(0.95, 0.8, 0.3) },
+            format!(
+                "Time {}    |    Best lap {}",
+                score.race_time.map_or("-".into(), race_time),
+                score.best_lap.map_or("-".into(), race_time)
+            ),
+        ),
+        (true, None) => ("WRECKED".to_string(), red, "Did not finish".to_string()),
+        (false, _) => (
+            if score.won { "LAST CAR RUNNING!".to_string() } else { "WRECKED".to_string() },
+            if score.won { green } else { red },
+            format!("Score {:.0}    |    {} wrecked", total_score(&score), score.wrecks),
+        ),
     };
+    let good = score.won || score.place.is_some_and(|p| p <= 2);
+    sounds.play(if good { Sfx::Win } else { Sfx::Lose }, 0.8);
     commands.spawn((
         DespawnOnExit(GameState::GameOver),
         Node {
@@ -2061,16 +2752,12 @@ fn show_game_over(mut commands: Commands, score: Res<Score>, mut sounds: ResMut<
                 TextColor(color),
             ),
             (
-                Text::new(format!(
-                    "Score {:.0}    |    {} wrecked",
-                    total_score(&score),
-                    score.wrecks
-                )),
+                Text::new(details),
                 TextFont { font_size: FontSize::Px(30.0), ..default() },
                 TextColor(Color::WHITE),
             ),
             (
-                Text::new("Enter: rematch    |    G: garage"),
+                Text::new("Enter: rematch    |    G: garage    |    M: menu"),
                 TextFont { font_size: FontSize::Px(22.0), ..default() },
                 TextColor(Color::srgb(0.7, 0.7, 0.7)),
             ),
@@ -2091,12 +2778,12 @@ fn game_over_input(
         }
         let n = sim.rounds as f32;
         eprintln!("SIM results over {} rounds (avg {:.0}s):", sim.rounds, sim.total_time / n);
-        let fair = 100.0 / (AI_CARS + 1) as f32;
+        let fair = 100.0 / sim.field.len().max(1) as f32;
         for ((m, w), entries) in MODELS.iter().zip(sim.wins).zip(sim.entries) {
             if entries == 0 {
                 continue;
             }
-            // Chance that any one car of this model wins its round; fair is 1 in 6.
+            // Chance that any one car of this model wins its round; fair is 1 in the field size.
             eprintln!(
                 "SIM   T{} {:<11} {:>3} wins / {:>3} cars entered = {:>5.1}% per car (fair {:.1}%)",
                 m.tier, m.name, w, entries, w as f32 / entries as f32 * 100.0, fair,
@@ -2110,5 +2797,7 @@ fn game_over_input(
         next.set(GameState::Playing);
     } else if keys.just_pressed(KeyCode::KeyG) {
         next.set(GameState::Garage);
+    } else if keys.any_just_pressed([KeyCode::KeyM, KeyCode::Escape]) {
+        next.set(GameState::Menu);
     }
 }

@@ -66,8 +66,8 @@
       <h1>ARENA DRIFT</h1>
       <p id="status">Loading…</p>
       <p class="keys">
-        Garage: Up/Down tier · Left/Right car · Tab arena · Enter race<br />
-        Driving: W/S throttle · A/D steer · Space handbrake · F/C/V fire
+        Menu &amp; garage: arrow keys choose · Tab arena/track · Enter or Space start<br />
+        Driving: arrows or WASD · Space handbrake · Ctrl or F/C/V fire
       </p>
     </div>
 
@@ -107,6 +107,15 @@
       // Clicking the game later (e.g. after switching tabs) refocuses it and wakes the audio.
       canvas.addEventListener("pointerdown", start);
       document.addEventListener("keydown", () => contexts.forEach((ctx) => ctx.state === "suspended" && ctx.resume()));
+
+      // Ctrl fires, and Ctrl+W (with W held for throttle) would close the tab.
+      // Pages can't block that shortcut, but they can ask before leaving.
+      addEventListener("beforeunload", (e) => {
+        if (overlay.classList.contains("hidden")) {
+          e.preventDefault();
+          e.returnValue = "";
+        }
+      });
     </script>
   </body>
 </html>

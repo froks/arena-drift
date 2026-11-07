@@ -2,8 +2,8 @@
 //!
 //! An arena is an [`ArenaDef`]: a size, colours, and a `build` function that
 //! places obstacles and decorations into a [`Layout`]. The boundary walls are
-//! ordinary box obstacles, so nothing assumes a rectangular play area — a race
-//! track can later be built from walls laid along a path plus a new [`Mode`].
+//! ordinary box obstacles, so nothing assumes a rectangular play area: a race
+//! track is a [`TrackDef`] whose edges become rows of barrier boxes.
 
 use std::collections::HashMap;
 use std::f32::consts::{FRAC_PI_2, TAU};
@@ -13,12 +13,13 @@ use bevy::prelude::*;
 use crate::RoundEntity;
 use crate::physics::{Contact, Obb};
 use crate::terrain::{Canvas, Terrain, berm, bump, smoothstep};
+use crate::track::{self, BARRIER, Track, TrackDef};
 
-/// What an arena is used for. Only derbies exist so far; a race track would
-/// add `Race { checkpoints, laps }` and reuse walls/obstacles as borders.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// What an arena is used for: a walled derby arena, or a race track.
+#[derive(Clone, Copy)]
 pub enum Mode {
     Derby,
+    Race(&'static TrackDef),
 }
 
 pub struct Theme {
@@ -44,7 +45,24 @@ pub struct ArenaDef {
     pub relief: fn(Vec2, Vec2) -> f32,
 }
 
-pub static ARENAS: [ArenaDef; 3] = [
+impl ArenaDef {
+    pub fn track(&self) -> Option<&'static TrackDef> {
+        match self.mode {
+            Mode::Race(t) => Some(t),
+            Mode::Derby => None,
+        }
+    }
+    pub fn is_race(&self) -> bool {
+        self.track().is_some()
+    }
+}
+
+/// Indices into [`ARENAS`] of the derby arenas (`race == false`) or the tracks.
+pub fn arenas_for(race: bool) -> Vec<usize> {
+    (0..ARENAS.len()).filter(|&i| ARENAS[i].is_race() == race).collect()
+}
+
+pub static ARENAS: [ArenaDef; 6] = [
     ArenaDef {
         name: "Dust Bowl",
         blurb: "Open dirt bowl. Tyre chicanes, concrete and a crowd that wants carnage.",
@@ -93,6 +111,54 @@ pub static ARENAS: [ArenaDef; 3] = [
         build: timberland,
         relief: timberland_relief,
     },
+    ArenaDef {
+        name: "Dustline Speedway",
+        blurb: "Fast sweepers round a dusty oval, with a kink on the back straight. Flat out.",
+        mode: Mode::Race(&track::DUSTLINE),
+        size: Vec2::new(3900.0, 2300.0),
+        theme: Theme {
+            floor: Color::srgb(0.45, 0.36, 0.24),
+            patches: [Color::srgb(0.4, 0.31, 0.2), Color::srgb(0.5, 0.4, 0.27)],
+            outfield: Color::srgb(0.36, 0.28, 0.19),
+            wall: Color::srgb(0.85, 0.85, 0.82),
+            wall_stripe: Some(Color::srgb(0.8, 0.15, 0.12)),
+        },
+        seed: 51,
+        build: dustline,
+        relief: dustline_relief,
+    },
+    ArenaDef {
+        name: "Red Canyon",
+        blurb: "Long and technical: a hairpin drops into the canyon and climbs back out.",
+        mode: Mode::Race(&track::RED_CANYON),
+        size: Vec2::new(4000.0, 2600.0),
+        theme: Theme {
+            floor: Color::srgb(0.55, 0.32, 0.2),
+            patches: [Color::srgb(0.5, 0.28, 0.17), Color::srgb(0.62, 0.38, 0.24)],
+            outfield: Color::srgb(0.48, 0.27, 0.17),
+            wall: Color::srgb(0.2, 0.2, 0.22),
+            wall_stripe: Some(Color::srgb(0.9, 0.8, 0.2)),
+        },
+        seed: 67,
+        build: red_canyon,
+        relief: red_canyon_relief,
+    },
+    ArenaDef {
+        name: "Pine Ridge",
+        blurb: "Through the woods, over the hills, and a quick S-bend on the far side.",
+        mode: Mode::Race(&track::PINE_RIDGE),
+        size: Vec2::new(3800.0, 2400.0),
+        theme: Theme {
+            floor: Color::srgb(0.28, 0.42, 0.2),
+            patches: [Color::srgb(0.24, 0.37, 0.18), Color::srgb(0.33, 0.46, 0.22)],
+            outfield: Color::srgb(0.2, 0.32, 0.15),
+            wall: Color::srgb(0.85, 0.85, 0.82),
+            wall_stripe: Some(Color::srgb(0.15, 0.4, 0.75)),
+        },
+        seed: 83,
+        build: pine_ridge,
+        relief: pine_ridge_relief,
+    },
 ];
 
 pub const WALL_THICKNESS: f32 = 24.0;
@@ -104,6 +170,8 @@ pub const WALL_THICKNESS: f32 = 24.0;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ObstacleKind {
     Wall,
+    /// Track-side barrier: forgiving, so scraping along it doesn't wreck you.
+    Barrier,
     TireStack,
     Concrete,
     Barrel,
@@ -120,7 +188,7 @@ impl ObstacleKind {
     pub fn restitution(self) -> f32 {
         match self {
             ObstacleKind::TireStack => 0.85,
-            ObstacleKind::HayBale => 0.2,
+            ObstacleKind::HayBale | ObstacleKind::Barrier => 0.2,
             _ => 0.35,
         }
     }
@@ -128,6 +196,7 @@ impl ObstacleKind {
     pub fn damage(self) -> f32 {
         match self {
             ObstacleKind::TireStack | ObstacleKind::HayBale => 0.25,
+            ObstacleKind::Barrier => 0.2,
             ObstacleKind::Concrete | ObstacleKind::Rock | ObstacleKind::Tree => 1.6,
             _ => 1.0,
         }
@@ -136,6 +205,7 @@ impl ObstacleKind {
         match self {
             ObstacleKind::Barrel => Color::srgb(0.85, 0.2, 0.1),
             ObstacleKind::Tree => Color::srgb(0.15, 0.35, 0.12),
+            ObstacleKind::Barrier => Color::srgb(0.75, 0.75, 0.75),
             _ => Color::srgb(0.55, 0.55, 0.55),
         }
     }
@@ -243,13 +313,28 @@ pub struct Layout {
     pub size: Vec2,
     pub obstacles: Vec<Obstacle>,
     pub decor: Vec<Decor>,
+    pub track: Option<Track>,
     rng: u32,
 }
 
 impl Layout {
     pub fn new(def: &ArenaDef) -> Self {
-        let mut layout = Self { size: def.size, obstacles: Vec::new(), decor: Vec::new(), rng: def.seed.max(1) };
-        layout.walls();
+        let track = def.track().map(Track::new);
+        let mut layout =
+            Self { size: def.size, obstacles: Vec::new(), decor: Vec::new(), track, rng: def.seed.max(1) };
+        match &layout.track {
+            Some(t) => {
+                let theme = &def.theme;
+                for (i, (pos, rot, size)) in t.barriers().into_iter().enumerate() {
+                    let tint = match theme.wall_stripe {
+                        Some(stripe) if i % 2 == 1 => stripe,
+                        _ => theme.wall,
+                    };
+                    layout.obstacles.push(Obstacle { kind: ObstacleKind::Barrier, shape: Shape::Box(size), pos, rot, tint });
+                }
+            }
+            None => layout.walls(),
+        }
         layout.ground_patches(def.theme.patches);
         (def.build)(&mut layout);
         layout
@@ -302,15 +387,22 @@ impl Layout {
         self.decor.push(Decor { kind, pos, rot, size, tint });
     }
 
-    /// Is there room for something of radius `r` at `pos`?
+    /// Is there room for something of radius `r` at `pos`? On a track that
+    /// means off the track, clear of the barriers.
     pub fn is_free(&self, pos: Vec2, r: f32, gap: f32) -> bool {
         let half = self.half() - Vec2::splat(r + 100.0);
         pos.x.abs() < half.x
             && pos.y.abs() < half.y
+            && self.track.as_ref().is_none_or(|t| t.distance(pos) > t.width / 2.0 + BARRIER + r + gap)
+            && self
+                .decor
+                .iter()
+                .filter(|d| d.kind == DecorKind::Stand)
+                .all(|d| d.pos.distance(pos) > d.size.x / 2.0 + r + gap)
             && self
                 .obstacles
                 .iter()
-                .filter(|o| o.kind != ObstacleKind::Wall)
+                .filter(|o| !matches!(o.kind, ObstacleKind::Wall | ObstacleKind::Barrier))
                 .all(|o| o.pos.distance(pos) > o.bounding_radius() + r + gap)
     }
 
@@ -568,6 +660,118 @@ fn timberland(l: &mut Layout) {
 }
 
 // ---------------------------------------------------------------------------
+// The race tracks
+// ---------------------------------------------------------------------------
+
+fn dustline_relief(p: Vec2, size: Vec2) -> f32 {
+    track::rolling(p, size, 18.0, 0.0)
+}
+
+/// Hills, and a canyon the hairpin drops down into.
+fn red_canyon_relief(p: Vec2, size: Vec2) -> f32 {
+    track::rolling(p, size, 30.0, 2.1) + bump(p, Vec2::new(0.0, 250.0), 520.0, -85.0)
+}
+
+fn pine_ridge_relief(p: Vec2, size: Vec2) -> f32 {
+    track::rolling(p, size, 40.0, 1.3)
+}
+
+impl Layout {
+    fn track(&self) -> &Track {
+        self.track.as_ref().expect("race layouts have a track")
+    }
+
+    /// Grandstands along the start straight, on the outside of the track.
+    fn grandstands(&mut self, from: f32, to: f32) {
+        let t = self.track().clone();
+        let mut s = from;
+        while s < to {
+            let (p, dir) = (t.point_at(s + 150.0), t.dir_at(s + 150.0));
+            let out = if (p + dir.perp() * 10.0).length() > (p - dir.perp() * 10.0).length() { dir.perp() } else { -dir.perp() };
+            let depth = 140.0;
+            let at = p + out * (t.width / 2.0 + BARRIER + 40.0 + depth / 2.0);
+            self.decor(DecorKind::Stand, at, out.to_angle() - FRAC_PI_2, Vec2::new(280.0, depth), Color::WHITE);
+            s += 300.0;
+        }
+    }
+
+    /// Something (tyre stacks, hay bales) along the outside of every sharp
+    /// corner, just beyond the barrier.
+    fn corner_guards(&mut self, mut place: impl FnMut(&mut Self, Vec2, f32)) {
+        let t = self.track().clone();
+        for i in (0..t.len()).step_by(2) {
+            let (p, dir, bend) = t.sample(i);
+            if bend.abs() < 1.0 / 420.0 {
+                continue;
+            }
+            let out = -dir.perp() * bend.signum();
+            place(self, p + out * (t.width / 2.0 + BARRIER + 40.0), dir.to_angle());
+        }
+    }
+
+    /// Scatter decorations of radius `r` anywhere off the track.
+    fn scatter(&mut self, count: usize, r: f32, gap: f32, mut place: impl FnMut(&mut Self, Vec2)) {
+        for _ in 0..count {
+            if let Some(p) = self.free_spot(r, gap) {
+                place(self, p);
+            }
+        }
+    }
+}
+
+fn dustline(l: &mut Layout) {
+    l.grandstands(-450.0, 600.0);
+    l.corner_guards(|l, p, _| l.tire_stack(p));
+    l.scatter(30, 30.0, 20.0, |l, p| {
+        let s = l.range(14.0, 26.0);
+        l.decor(DecorKind::Bush, p, 0.0, Vec2::splat(s), Color::WHITE);
+    });
+    l.scatter(12, 50.0, 40.0, |l, p| {
+        let s = l.range(40.0, 60.0);
+        l.decor(DecorKind::Tree, p, 0.0, Vec2::splat(s), Color::WHITE);
+    });
+    let h = l.half();
+    for (sx, sy) in [(1.0, 1.0), (1.0, -1.0), (-1.0, 1.0), (-1.0, -1.0)] {
+        l.decor(DecorKind::Floodlight, Vec2::new(sx * (h.x - 60.0), sy * (h.y - 60.0)), 0.0, Vec2::splat(1.0), Color::WHITE);
+    }
+}
+
+fn red_canyon(l: &mut Layout) {
+    l.grandstands(-300.0, 300.0);
+    l.corner_guards(|l, p, _| l.tire_stack(p));
+    l.scatter(45, 45.0, 30.0, |l, p| {
+        let r = l.range(25.0, 60.0);
+        l.rock(p, r);
+    });
+    l.scatter(25, 30.0, 20.0, |l, p| {
+        let s = l.range(12.0, 22.0);
+        l.decor(DecorKind::Bush, p, 0.0, Vec2::splat(s), Color::WHITE);
+    });
+    l.scatter(12, 80.0, 30.0, |l, p| {
+        let s = l.range(70.0, 130.0);
+        l.decor(DecorKind::ScrapPile, p, 0.0, Vec2::splat(s), Color::WHITE);
+    });
+}
+
+fn pine_ridge(l: &mut Layout) {
+    l.grandstands(-300.0, 300.0);
+    l.corner_guards(|l, p, rot| l.hay(p, rot));
+    l.scatter(140, 55.0, 15.0, |l, p| {
+        let s = l.range(40.0, 70.0);
+        l.decor(DecorKind::Tree, p, 0.0, Vec2::splat(s), Color::WHITE);
+    });
+    l.scatter(14, 40.0, 30.0, |l, p| {
+        let r = l.range(20.0, 40.0);
+        l.rock(p, r);
+    });
+    l.scatter(60, 20.0, 10.0, |l, p| {
+        let s = l.range(14.0, 26.0);
+        l.decor(DecorKind::Bush, p, 0.0, Vec2::splat(s), Color::WHITE);
+    });
+    l.scatter(80, 10.0, 10.0, |l, p| l.decor(DecorKind::GrassTuft, p, 0.0, Vec2::splat(1.0), Color::WHITE));
+}
+
+// ---------------------------------------------------------------------------
 // Starting grid
 // ---------------------------------------------------------------------------
 
@@ -687,6 +891,8 @@ struct Painter<'a, 'w, 's> {
     art: &'a mut ArenaArt,
     materials: &'a mut Assets<StandardMaterial>,
     terrain: Terrain,
+    /// Whether trees inside the arena fade out under the player.
+    fade_trees: bool,
 }
 
 impl Painter<'_, '_, '_> {
@@ -753,15 +959,20 @@ pub fn spawn_arena(
     images: &mut Assets<Image>,
     materials: &mut Assets<StandardMaterial>,
     def: &ArenaDef,
-) -> (Vec<Obstacle>, Terrain) {
+) -> (Vec<Obstacle>, Terrain, Option<Track>) {
     let layout = Layout::new(def);
     let terrain = Terrain::new(def.relief, def.size);
     let mut canvas = Canvas::new(def.size, def.theme.outfield);
     canvas.rect(Vec2::ZERO, 0.0, def.size, def.theme.floor);
-    let mut p = Painter { commands, art, materials, terrain };
+    let fade_trees = !def.is_race();
+    let mut p = Painter { commands, art, materials, terrain, fade_trees };
 
     for d in &layout.decor {
         draw_decor(&mut p, &mut canvas, d);
+    }
+    if let (Some(t), Some(td)) = (&layout.track, def.track()) {
+        paint_track(&mut canvas, t, td);
+        draw_gantry(&mut p, t);
     }
     for o in &layout.obstacles {
         let root = draw_obstacle(&mut p, o, &def.theme);
@@ -776,7 +987,71 @@ pub fn spawn_arena(
 
     let (mesh, material) = crate::terrain::build_ground(&terrain, canvas, meshes, images, p.materials);
     p.commands.spawn((RoundEntity, mesh, material, Transform::default()));
-    (layout.obstacles, terrain)
+    (layout.obstacles, terrain, layout.track)
+}
+
+/// Asphalt, kerbs, the chequered start line and the grid boxes.
+fn paint_track(canvas: &mut Canvas, t: &Track, def: &TrackDef) {
+    let half = t.width / 2.0;
+    for i in 0..t.len() {
+        let (p, _, _) = t.sample(i);
+        canvas.ellipse(p, 0.0, Vec2::splat(half), def.asphalt);
+    }
+    for i in 0..t.len() {
+        let (p, dir, _) = t.sample(i);
+        let color = def.kerbs[(i / 2) % 2];
+        for side in [-1.0, 1.0] {
+            canvas.rect(p + dir.perp() * side * (half - 7.0), dir.to_angle(), Vec2::new(t.step() + 1.0, 14.0), color);
+        }
+    }
+    // Chequered line across the track at s = 0.
+    let (p, dir) = (t.point_at(0.0), t.dir_at(0.0));
+    let square = 16.0;
+    let n = (t.width / square).floor() as i32;
+    for row in 0..2 {
+        for k in 0..n {
+            let across = (k as f32 + 0.5 - n as f32 / 2.0) * square;
+            let along = (row as f32 - 0.5) * square;
+            let color = if (k + row) % 2 == 0 { Color::srgb(0.95, 0.95, 0.95) } else { Color::srgb(0.08, 0.08, 0.08) };
+            canvas.rect(p + dir * along + dir.perp() * across, dir.to_angle(), Vec2::splat(square), color);
+        }
+    }
+    // Grid boxes: a bracket in front of each starting slot.
+    let white = Color::srgba(1.0, 1.0, 1.0, 0.8);
+    for (at, heading) in t.grid(crate::RACE_CARS) {
+        let dir = Vec2::from_angle(heading);
+        canvas.rect(at + dir * 32.0, heading, Vec2::new(4.0, 48.0), white);
+        for side in [-1.0, 1.0] {
+            canvas.rect(at + dir * 14.0 + dir.perp() * side * 24.0, heading, Vec2::new(36.0, 4.0), white);
+        }
+    }
+}
+
+/// A gantry over the start/finish line.
+fn draw_gantry(p: &mut Painter, t: &Track) {
+    let (at, dir) = (t.point_at(0.0), t.dir_at(0.0));
+    let ground = p.terrain.height(at);
+    let root = p.root_at(at.extend(ground), Quat::from_rotation_z(dir.to_angle()));
+    let reach = t.width / 2.0 + BARRIER + 16.0;
+    let steel = Color::srgb(0.25, 0.25, 0.28);
+    let mut top = 0.0_f32;
+    for side in [-1.0, 1.0] {
+        let foot = Vec2::new(0.0, side * reach);
+        let base = p.terrain.height(at + dir.perp() * side * reach) - ground;
+        top = top.max(base);
+        p.block(root, steel, foot, base - 10.0, Vec3::new(20.0, 20.0, 14.0));
+        p.post(root, steel, foot, base - 10.0, 6.0, 130.0);
+    }
+    let beam = top + 100.0;
+    p.block(root, steel, Vec2::ZERO, beam, Vec3::new(14.0, reach * 2.0 + 14.0, 14.0));
+    let n = ((reach * 2.0) / 16.0) as i32;
+    for k in 0..n {
+        for row in 0..2 {
+            let y = (k as f32 + 0.5 - n as f32 / 2.0) * 16.0;
+            let color = if (k + row) % 2 == 0 { Color::srgb(0.95, 0.95, 0.95) } else { Color::srgb(0.08, 0.08, 0.08) };
+            p.block(root, color, Vec2::new((row as f32 - 0.5) * 7.0, y), beam + 14.0, Vec3::new(7.0, 16.0, 1.0));
+        }
+    }
 }
 
 fn draw_obstacle(p: &mut Painter, o: &Obstacle, theme: &Theme) -> Entity {
@@ -805,6 +1080,16 @@ fn draw_obstacle(p: &mut Painter, o: &Obstacle, theme: &Theme) -> Entity {
                     p.block(root, stripe, at, lo, size(seg * 0.5, across + 0.6, hi - lo + 0.6));
                 }
             }
+            root
+        }
+        (ObstacleKind::Barrier, Shape::Box(s)) => {
+            // One block per barrier section, standing on the lower of its ends.
+            let root = p.root_at(o.pos.extend(0.0), Quat::from_rotation_z(o.rot));
+            let along = Vec2::from_angle(o.rot) * s.x / 2.0;
+            let ends = [-1.0, 0.0, 1.0].map(|k| p.terrain.height(o.pos + along * k));
+            let lo = ends.iter().copied().fold(f32::MAX, f32::min) - 20.0;
+            let hi = ends.iter().copied().fold(f32::MIN, f32::max) + 26.0;
+            p.block(root, o.tint, Vec2::ZERO, lo, Vec3::new(s.x, s.y, hi - lo));
             root
         }
         (ObstacleKind::TireStack, Shape::Circle(r)) => {
@@ -933,7 +1218,8 @@ fn draw_decor(p: &mut Painter, canvas: &mut Canvas, d: &Decor) {
             ];
             // Inside the arena, cars can drive under trees: give each its own
             // materials so it can fade out over the player.
-            let inside = d.pos.x.abs() < p.terrain_half().x && d.pos.y.abs() < p.terrain_half().y;
+            let inside =
+                p.fade_trees && d.pos.x.abs() < p.terrain_half().x && d.pos.y.abs() < p.terrain_half().y;
             let mut faders = Vec::new();
             for (off, up, size, color) in blobs {
                 let material = if inside {
@@ -1068,7 +1354,7 @@ mod tests {
 
     #[test]
     fn layouts_keep_obstacles_inside_and_apart() {
-        for def in &ARENAS {
+        for def in ARENAS.iter().filter(|d| !d.is_race()) {
             let l = Layout::new(def);
             let half = def.size / 2.0;
             let inner: Vec<&Obstacle> = l.obstacles.iter().filter(|o| o.kind != ObstacleKind::Wall).collect();
@@ -1089,7 +1375,7 @@ mod tests {
 
     #[test]
     fn every_car_starts_with_open_road() {
-        for def in &ARENAS {
+        for def in ARENAS.iter().filter(|d| !d.is_race()) {
             let layout = Layout::new(def);
             let (points, all_fair) = spawn_points(&layout.obstacles, def.size, 6);
             assert!(all_fair, "{}: some car has no fair start: {points:?}", def.name);
@@ -1105,6 +1391,22 @@ mod tests {
         assert!(!fair_spawn(&layout.obstacles, old, (-old).to_angle()));
         let (points, _) = spawn_points(&layout.obstacles, ARENAS[0].size, 6);
         assert!(points[0].0.distance(old) > 50.0, "player still starts at {:?}", points[0].0);
+    }
+
+    #[test]
+    fn track_scenery_stays_off_the_track() {
+        for def in ARENAS.iter().filter(|d| d.is_race()) {
+            let l = Layout::new(def);
+            let t = l.track.as_ref().unwrap();
+            let clear = t.width / 2.0 + BARRIER;
+            for o in l.obstacles.iter().filter(|o| o.kind != ObstacleKind::Barrier) {
+                let d = t.distance(o.pos) - o.bounding_radius();
+                assert!(d > clear, "{}: {:?} at {} is on the track", def.name, o.kind, o.pos);
+            }
+            for d in l.decor.iter().filter(|d| matches!(d.kind, DecorKind::Tree | DecorKind::Stand)) {
+                assert!(t.distance(d.pos) > clear, "{}: {:?} at {} is on the track", def.name, d.kind, d.pos);
+            }
+        }
     }
 
     #[test]

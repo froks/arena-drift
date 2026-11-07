@@ -39,10 +39,14 @@ pub enum Sfx {
     Wreck,
     Win,
     Lose,
+    /// Countdown before a race: "3, 2, 1"...
+    Beep,
+    /// ...and "go".
+    Go,
 }
 
 impl Sfx {
-    const COUNT: usize = 12;
+    const COUNT: usize = 14;
 
     /// Small random pitch changes keep repeated sounds from getting tiring.
     fn pitch_jitter(self) -> f32 {
@@ -108,6 +112,8 @@ fn build_sounds(mut commands: Commands, mut sources: ResMut<Assets<AudioSource>>
         add(wreck()),
         add(win()),
         add(lose()),
+        add(beep(440.0, 0.25)),
+        add(beep(880.0, 0.6)),
     ];
     for base_rpm in ENGINE_LAYERS {
         let handle = add(engine_loop(base_rpm));
@@ -415,6 +421,14 @@ fn wreck() -> Vec<f32> {
 
 fn win() -> Vec<f32> {
     arpeggio(&[523.0, 659.0, 784.0, 1047.0], 0.12, 0.6, square)
+}
+
+/// A plain start-light beep.
+fn beep(freq: f32, dur: f32) -> Vec<f32> {
+    render(dur, |t| {
+        let p = (t * freq) % 1.0;
+        (sine(p) * 0.7 + square(p) * 0.15) * env(t, 0.005, 3.0 / dur)
+    })
 }
 
 fn lose() -> Vec<f32> {
