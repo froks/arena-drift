@@ -55,8 +55,11 @@ build it yourself (see below).
 - **Camera and minimap.** The camera follows your car and zooms out with speed, a minimap shows the whole arena,
   and sliding cars leave skid marks.
 - **Generated synthpop soundtrack.** Every arena and track has its own fast synthpop song (four-on-the-floor
-  drums, bouncing bass, pumping supersaw chords, arpeggios and a lead hook, arranged into intro, verse, chorus
-  and breakdown), and the menus have a calmer one. The track selection screen plays each track's song as you
+  drums, bouncing bass, pumping chords, arpeggios and a lead hook, arranged into intro, verse, chorus and
+  breakdown), and the menus have a calmer one. Each venue adds its own flavour: the sandy ones go oriental
+  (Middle-Eastern scales, darbuka rhythms, a drone, an oud-like pluck and a ney-like lead with grace notes), the
+  wooded ones go folky and natural (woodblock and shaker, kalimba, flute, birdsong and wind chimes), and the
+  Junkyard goes industrial (metal clanks and a crunchy bit-crushed lead). The track selection screen plays each track's song as you
   browse. Songs crossfade between screens, and `N` switches music off and on.
 - **Generated sound.** Every sound effect and the engine are synthesised in code too, so the game ships with no
   audio files. Sounds from other cars get quieter with distance; your tyres screech when you really slide, water
