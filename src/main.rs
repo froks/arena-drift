@@ -565,18 +565,25 @@ fn main() {
         .init_resource::<MenuChoice>()
         .init_resource::<LastInput>()
         // Dev shortcut: ARENA_DRIFT_AUTOSTART=1 skips the menu and garage.
-        .insert_state(if autostart { GameState::Playing } else { GameState::Menu })
+        .insert_state(if autostart {
+            GameState::Playing
+        } else if std::env::var_os("ARENA_DRIFT_GARAGE").is_some() {
+            GameState::Garage
+        } else {
+            GameState::Menu
+        })
         .init_resource::<CarArt>()
         .init_resource::<IconArt>()
         .init_resource::<ArenaArt>()
         .add_systems(Startup, setup_world)
-        .add_systems(Update, dev_screenshot)
+        .add_systems(Update, (dev_screenshot, fit_ui_to_window))
         .add_systems(PreUpdate, gamepad_menu_keys.after(bevy::input::InputSystems))
         .add_systems(OnEnter(GameState::Menu), setup_menu)
         .add_systems(Update, menu_input.run_if(in_state(GameState::Menu)))
         .add_systems(OnEnter(GameState::Garage), setup_garage)
         .add_systems(Update, (garage_input, garage_animate).chain().run_if(in_state(GameState::Garage)))
         .add_systems(OnEnter(GameState::Playing), start_round)
+        .add_systems(Update, abort_round.run_if(in_state(GameState::Playing)))
         .add_systems(
             Update,
             (
@@ -661,6 +668,15 @@ fn dev_look() -> Option<(Vec2, f32)> {
     let v = std::env::var("ARENA_DRIFT_LOOK").ok()?;
     let n: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
     (n.len() == 3).then(|| (Vec2::new(n[0], n[1]), n[2]))
+}
+
+/// The UI is laid out for a 1280x800 window; in a smaller one (a browser
+/// tab, say) it shrinks to match, like the showroom does.
+fn fit_ui_to_window(window: Single<&Window, With<PrimaryWindow>>, mut scale: ResMut<UiScale>) {
+    let fit = (window.width() / 1280.0).min(window.height() / 800.0).clamp(0.4, 1.0);
+    if (scale.0 - fit).abs() > 0.01 {
+        scale.0 = fit;
+    }
 }
 
 /// Vertical field of view. Wider means more parallax on tall things.
@@ -1018,6 +1034,26 @@ struct GarageCar(usize);
 #[derive(Component)]
 struct GarageInfo;
 
+/// Controls hint under the garage stats.
+#[derive(Component)]
+struct GarageHelp;
+
+/// The coloured part of stat bar number `.0` in the garage.
+#[derive(Component)]
+struct StatFill(usize);
+
+/// How to read one stat off a model.
+type Stat = fn(&CarModel) -> f32;
+
+/// Garage stats: name, colour, and how to read it off a model.
+const STATS: [(&str, Color, Stat); 5] = [
+    ("Top speed", Color::srgb(0.95, 0.55, 0.2), |m| m.top_speed),
+    ("Accel", Color::srgb(0.95, 0.8, 0.3), |m| m.engine),
+    ("Handling", Color::srgb(0.3, 0.8, 0.95), |m| m.turn_rate * 0.6 + m.grip * 0.4),
+    ("Toughness", Color::srgb(0.4, 0.85, 0.4), |m| m.max_hp * m.armor),
+    ("Weight", Color::srgb(0.65, 0.65, 0.8), |m| m.mass),
+];
+
 const GARAGE_SPACING: f32 = 260.0;
 const GARAGE_Y: f32 = 170.0;
 
@@ -1080,31 +1116,79 @@ fn setup_garage(
             padding: UiRect::vertical(px(4)),
             ..default()
         },
-        children![
-            (
-                Text::new("CHOOSE YOUR RIDE"),
-                TextFont { font_size: FontSize::Px(40.0), ..default() },
-                TextColor(Color::srgb(0.95, 0.8, 0.3)),
-            ),
-            (
+    ))
+    .with_children(|root| {
+        root.spawn((
+            Text::new("CHOOSE YOUR RIDE"),
+            TextFont { font_size: FontSize::Px(40.0), ..default() },
+            TextColor(Color::srgb(0.95, 0.8, 0.3)),
+        ));
+        root.spawn(Node {
+            width: px(940),
+            flex_direction: FlexDirection::Column,
+            row_gap: px(12),
+            margin: UiRect::bottom(px(52)),
+            ..default()
+        })
+        .with_children(|panel| {
+            panel.spawn((
                 GarageInfo,
                 Text::new(""),
                 TextFont { font_size: FontSize::Px(22.0), ..default() },
                 TextColor(Color::WHITE),
-                Node { margin: UiRect::bottom(px(30)), ..default() },
-            ),
-        ],
-    ));
+            ));
+            // Stat bars in two columns: a label, a dark track and a coloured fill.
+            panel
+                .spawn(Node { flex_wrap: FlexWrap::Wrap, row_gap: px(9), column_gap: px(40), ..default() })
+                .with_children(|rows| {
+                    for (i, (name, color, _)) in STATS.iter().enumerate() {
+                        rows.spawn(Node { align_items: AlignItems::Center, column_gap: px(14), ..default() })
+                            .with_children(|row| {
+                                row.spawn((
+                                    Text::new(*name),
+                                    TextFont { font_size: FontSize::Px(20.0), ..default() },
+                                    TextColor(Color::srgb(0.85, 0.85, 0.85)),
+                                    Node { width: px(115), ..default() },
+                                ));
+                                row.spawn((
+                                    Node {
+                                        width: px(290),
+                                        height: px(22),
+                                        border: UiRect::all(px(1)),
+                                        padding: UiRect::all(px(2)),
+                                        ..default()
+                                    },
+                                    BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.45)),
+                                    BorderColor::all(Color::srgba(1.0, 1.0, 1.0, 0.25)),
+                                ))
+                                .with_children(|track| {
+                                    track.spawn((
+                                        StatFill(i),
+                                        Node { width: percent(50), height: percent(100), ..default() },
+                                        BackgroundColor(*color),
+                                    ));
+                                });
+                            });
+                    }
+                });
+            panel.spawn((
+                GarageHelp,
+                Text::new(""),
+                TextFont { font_size: FontSize::Px(18.0), ..default() },
+                TextColor(Color::srgb(0.65, 0.65, 0.65)),
+            ));
+        });
+    });
 }
 
-/// A text bar like `######----` scaled between the weakest and strongest model.
-fn stat_bar(value: f32, stat: impl Fn(&CarModel) -> f32) -> String {
+/// Where a model sits between the weakest and strongest of all models on a
+/// stat, as a fraction for its bar (never quite empty).
+fn stat_fraction(value: f32, stat: Stat) -> f32 {
     let (lo, hi) = MODELS
         .iter()
-        .map(&stat)
+        .map(stat)
         .fold((f32::MAX, f32::MIN), |(lo, hi), v| (lo.min(v), hi.max(v)));
-    let filled = 2 + ((value - lo) / (hi - lo).max(1e-6) * 8.0).round() as usize;
-    format!("{}{}", "#".repeat(filled), "-".repeat(10 - filled))
+    0.12 + 0.88 * ((value - lo) / (hi - lo).max(1e-6)).clamp(0.0, 1.0)
 }
 
 fn garage_input(
@@ -1112,7 +1196,9 @@ fn garage_input(
     mut selected: ResMut<SelectedCar>,
     mut current: ResMut<CurrentArena>,
     mut next: ResMut<NextState<GameState>>,
-    mut info: Query<&mut Text, With<GarageInfo>>,
+    mut info: Query<&mut Text, (With<GarageInfo>, Without<GarageHelp>)>,
+    mut help: Query<&mut Text, (With<GarageHelp>, Without<GarageInfo>)>,
+    mut fills: Query<(&StatFill, &mut Node)>,
 ) {
     if keys.just_pressed(KeyCode::Tab) {
         // Next arena or track of the same kind.
@@ -1151,35 +1237,40 @@ fn garage_input(
 
     let Ok(mut text) = info.single_mut() else { return };
     let m = &MODELS[selected.0];
-    let handling = |m: &CarModel| m.turn_rate * 0.6 + m.grip * 0.4;
-    let toughness = |m: &CarModel| m.max_hp * m.armor;
     let def = current.def();
     let venue = match def.track() {
         Some(t) => format!("Track: {} ({} laps)", def.name.to_uppercase(), t.laps),
         None => format!("Arena: {}", def.name.to_uppercase()),
     };
-    text.0 = format!(
-        "TIER {}   <  {}  >\n{}\nRivals: {}\n\n{}  -  Tab to change\n{}\n\n\
-         Top speed  {}\n\
-         Accel      {}\n\
-         Handling   {}\n\
-         Toughness  {}\n\
-         Weight     {}\n\n\
-         Up/Down tier  |  Left/Right car  |  Enter/Space start  |  Esc menu\n\
-         Gamepad: D-pad choose  |  Y change {}  |  A start  |  B menu",
+    let want = format!(
+        "TIER {}   <  {}  >\n{}\nRivals: {}\n\n{}  -  Tab to change\n{}",
         m.tier,
         m.name.to_uppercase(),
         m.blurb,
         cars::tier_models(m.tier).iter().map(|&i| MODELS[i].name).collect::<Vec<_>>().join(", "),
         venue,
         def.blurb,
-        stat_bar(m.top_speed, |m| m.top_speed),
-        stat_bar(m.engine, |m| m.engine),
-        stat_bar(handling(m), handling),
-        stat_bar(toughness(m), toughness),
-        stat_bar(m.mass, |m| m.mass),
-        if def.is_race() { "track" } else { "arena" },
     );
+    if text.0 != want {
+        text.0 = want;
+    }
+    for (fill, mut node) in &mut fills {
+        let (_, _, stat) = STATS[fill.0];
+        let width = percent(stat_fraction(stat(m), stat) * 100.0);
+        if node.width != width {
+            node.width = width;
+        }
+    }
+    if let Ok(mut help) = help.single_mut() {
+        let want = format!(
+            "Up/Down tier  |  Left/Right car  |  Enter/Space start  |  Esc menu\n\
+             Gamepad: D-pad choose  |  Y change {}  |  A start  |  B menu",
+            if def.is_race() { "track" } else { "arena" },
+        );
+        if help.0 != want {
+            help.0 = want;
+        }
+    }
 }
 
 fn garage_animate(
@@ -1206,6 +1297,13 @@ fn garage_animate(
             tf.scale = Vec3::splat(2.0);
             tf.rotation = Quat::from_rotation_z(up);
         }
+    }
+}
+
+/// Esc (or Start on a gamepad) leaves a race or derby for the main menu.
+fn abort_round(keys: Res<ButtonInput<KeyCode>>, sim: Option<Res<Sim>>, mut next: ResMut<NextState<GameState>>) {
+    if sim.is_none() && keys.just_pressed(KeyCode::Escape) {
+        next.set(GameState::Menu);
     }
 }
 
@@ -1318,10 +1416,11 @@ fn gamepad_menu_keys(
     mut held: Local<Vec<KeyCode>>,
 ) {
     let mut want = Vec::new();
+    let driving = *state.get() == GameState::Playing;
     for pad in &pads {
         let mut dir = pad.dpad();
         // While driving the stick steers by itself; arrows would mean full lock.
-        if *state.get() != GameState::Playing {
+        if !driving {
             let stick = pad.left_stick();
             if stick.length() > 0.6 {
                 dir += stick;
@@ -1332,8 +1431,9 @@ fn gamepad_menu_keys(
             (dir.y < -0.5, KeyCode::ArrowDown),
             (dir.x < -0.5, KeyCode::ArrowLeft),
             (dir.x > 0.5, KeyCode::ArrowRight),
-            (pad.pressed(GamepadButton::South) || pad.pressed(GamepadButton::Start), KeyCode::Enter),
-            (pad.pressed(GamepadButton::East), KeyCode::Escape),
+            (pad.pressed(GamepadButton::South) || pad.pressed(GamepadButton::Start) && !driving, KeyCode::Enter),
+            // While driving, B is the handbrake and Start leaves the race.
+            (if driving { pad.pressed(GamepadButton::Start) } else { pad.pressed(GamepadButton::East) }, KeyCode::Escape),
             (pad.pressed(GamepadButton::North) || pad.pressed(GamepadButton::Select), KeyCode::Tab),
         ] {
             if on && !want.contains(&key) {
@@ -2964,8 +3064,8 @@ fn update_hud(
 ) {
     let Ok(mut text) = hud.single_mut() else { return };
     let help = match last.0 {
-        InputDevice::Keyboard => "W/S or arrows drive  |  Space handbrake  |  Ctrl or F/C/V fire",
-        InputDevice::Gamepad => "Left stick or RT/LT drive  |  B/LB handbrake  |  A/RB fire",
+        InputDevice::Keyboard => "W/S or arrows drive  |  Space handbrake  |  Ctrl or F/C/V fire  |  Esc menu",
+        InputDevice::Gamepad => "Left stick or RT/LT drive  |  B/LB handbrake  |  A/RB fire  |  Start menu",
     };
     let Some((player, car, armory, _, racer)) = cars.iter().find(|(.., p, _)| *p) else { return };
 

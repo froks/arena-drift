@@ -391,6 +391,29 @@ impl Track {
         out
     }
 
+    /// The barriers as drawn: one wall section per pair of samples on each
+    /// side, as (inner start, inner end, outer start, outer end, striped).
+    /// Sections meet exactly end to end, so nothing overlaps.
+    pub fn barrier_walls(&self) -> Vec<([Vec2; 4], bool)> {
+        let jumps = self.jumps();
+        let n = self.len();
+        let inner = self.width / 2.0;
+        let mut out = Vec::new();
+        for side in [1.0, -1.0] {
+            let at = |i: usize, d: f32| self.points[i % n] + self.dirs[i % n].perp() * side * d;
+            for (k, i) in (0..n).step_by(2).enumerate() {
+                let j = (i + 2).min(n); // the last section closes the loop exactly
+                let s = i as f32 * self.step();
+                if jumps.iter().any(|&jump| self.delta(jump, s).abs() < RAVINE_GAP / 2.0 + 40.0) {
+                    continue;
+                }
+                let quad = [at(i, inner), at(j, inner), at(i, inner + BARRIER), at(j, inner + BARRIER)];
+                out.push((quad, k % 2 == 1));
+            }
+        }
+        out
+    }
+
     /// Starting grid: two columns, staggered, behind the start line.
     pub fn grid(&self, count: usize) -> Vec<(Vec2, f32)> {
         (0..count)

@@ -1017,6 +1017,19 @@ pub fn spawn_arena(
                 bevy::light::NotShadowCaster,
             ));
         }
+        let walls = p.materials.add(StandardMaterial {
+            perceptual_roughness: 0.9,
+            reflectance: 0.2,
+            double_sided: true,
+            cull_mode: None,
+            ..default()
+        });
+        p.commands.spawn((
+            RoundEntity,
+            Mesh3d(meshes.add(barrier_mesh(t, &terrain, &def.theme))),
+            MeshMaterial3d(walls),
+            Transform::default(),
+        ));
         draw_gantry(&mut p, t);
     }
     for o in &layout.obstacles {
@@ -1205,6 +1218,51 @@ fn ribbon(sections: &[Section], top: bool) -> Mesh {
         .with_inserted_indices(Indices::U32(idx))
 }
 
+/// Every track barrier in one mesh: walls that meet end to end (no
+/// overlapping faces to flicker), coloured in alternating sections, with
+/// their tops following the ground.
+fn barrier_mesh(t: &Track, terrain: &Terrain, theme: &Theme) -> Mesh {
+    use bevy::asset::RenderAssetUsages;
+    use bevy::mesh::{Indices, PrimitiveTopology};
+    let (mut pos, mut normals, mut colors, mut idx) = (vec![], vec![], vec![], vec![]);
+    let mut quad = |mut corners: [Vec3; 4], normal: Vec3, color: [f32; 4]| {
+        // Wind the triangles to face along `normal`, so lighting is right on
+        // both sides of the track (mirrored corners would face backwards).
+        if (corners[1] - corners[0]).cross(corners[2] - corners[0]).dot(normal) < 0.0 {
+            corners.reverse();
+        }
+        let base = pos.len() as u32;
+        for c in corners {
+            pos.push(c.to_array());
+            normals.push(normal.to_array());
+            colors.push(color);
+        }
+        idx.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+    };
+    for ([ia, ib, oa, ob], striped) in t.barrier_walls() {
+        let color = match theme.wall_stripe {
+            Some(stripe) if striped => stripe,
+            _ => theme.wall,
+        };
+        let c = color.to_linear();
+        let color = [c.red, c.green, c.blue, 1.0];
+        let top = |p: Vec2| terrain.height(p) + 26.0;
+        let bottom = |p: Vec2| terrain.height(p) - 20.0;
+        let up = |p: Vec2| p.extend(top(p));
+        let down = |p: Vec2| p.extend(bottom(p));
+        let inward = ((ia + ib) / 2.0 - (oa + ob) / 2.0).normalize_or_zero().extend(0.0);
+        quad([up(ia), up(ib), up(ob), up(oa)], Vec3::Z, color);
+        quad([up(ia), up(ib), down(ib), down(ia)], inward, color);
+        quad([up(oa), up(ob), down(ob), down(oa)], -inward, color);
+    }
+    // The material uses vertex colours for the paint.
+    Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::RENDER_WORLD)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, pos)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
+        .with_inserted_indices(Indices::U32(idx))
+}
+
 /// The top of a ribbon as a fine grid whose opacity is `alpha` at each
 /// point, with vertices relative to `origin`.
 fn faded_top(sections: &[Section], origin: Vec3, alpha: &dyn Fn(Vec2) -> f32) -> Mesh {
@@ -1367,7 +1425,9 @@ fn draw_crossing(
             for side in [-1.0, 1.0] {
                 let e = c + dir.perp() * side * (road - 7.0);
                 let root = p.root_at(e.extend(p.terrain.height(e)), Quat::from_rotation_z(dir.to_angle()));
-                p.block(root, color, Vec2::ZERO, -0.5, Vec3::new((s1 - s0) / n as f32 + 1.0, 14.0, 0.9));
+                // Every other block a hair higher, so overlapping ends don't flicker.
+                let lift = (i % 2) as f32 * 0.25;
+                p.block(root, color, Vec2::ZERO, -0.5, Vec3::new((s1 - s0) / n as f32 + 1.0, 14.0 + lift, 0.9 + lift));
             }
         }
         // Pillars where the river runs underneath.
@@ -1461,16 +1521,8 @@ fn draw_obstacle(p: &mut Painter, o: &Obstacle, theme: &Theme) -> Entity {
             }
             root
         }
-        (ObstacleKind::Barrier, Shape::Box(s)) => {
-            // One block per barrier section, standing on the lower of its ends.
-            let root = p.root_at(o.pos.extend(0.0), Quat::from_rotation_z(o.rot));
-            let along = Vec2::from_angle(o.rot) * s.x / 2.0;
-            let ends = [-1.0, 0.0, 1.0].map(|k| p.terrain.height(o.pos + along * k));
-            let lo = ends.iter().copied().fold(f32::MAX, f32::min) - 20.0;
-            let hi = ends.iter().copied().fold(f32::MIN, f32::max) + 26.0;
-            p.block(root, o.tint, Vec2::ZERO, lo, Vec3::new(s.x, s.y, hi - lo));
-            root
-        }
+        // Track barriers are drawn as one continuous mesh (see `barrier_mesh`).
+        (ObstacleKind::Barrier, _) => p.root_at(o.pos.extend(0.0), Quat::IDENTITY),
         (ObstacleKind::TireStack, Shape::Circle(r)) => {
             let root = p.root(o.pos, 0.0, footprint);
             for k in 0..3 {

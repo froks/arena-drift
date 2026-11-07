@@ -76,6 +76,7 @@ build it yourself (see below).
 | | A / D or Left / Right | Steer |
 | | Space | Handbrake |
 | | Ctrl, F, C or V | Fire the current weapon |
+| | Esc | Leave the race or match, back to the menu |
 | After a match | Enter | Rematch |
 | | G | Back to the garage |
 | | M / Esc | Back to the menu |
@@ -89,6 +90,7 @@ buttons):
 | | Right / left trigger | Throttle / brake and reverse (analog) |
 | | A or RB | Fire |
 | | B or LB | Handbrake |
+| | Start | Leave the race or match, back to the menu |
 | Menus | D-pad or left stick | Choose |
 | | A or Start | Confirm |
 | | B | Back |
@@ -173,6 +175,7 @@ These environment variables help with testing and balancing:
 | Variable | Effect |
 |---|---|
 | `ARENA_DRIFT_AUTOSTART=1` | Skip the menu and garage and go straight into a match. |
+| `ARENA_DRIFT_GARAGE=1` | Start in the garage instead of the menu. |
 | `ARENA_DRIFT_ARENA=<n>` | Start in arena `n`: 0 is Dust Bowl, 1 is Junkyard, 2 is Timberland, 3 is Dustline Speedway, 4 is Red Canyon, 5 is Pine Ridge. |
 | `ARENA_DRIFT_SIM=<rounds>` | Balance simulation: AI-only rounds at 3× speed with sound off. Prints each round's winner and a win table at the end. On a track it also prints every car's finishing time and best lap. |
 | `ARENA_DRIFT_SIM_TIER=<t>` | With `ARENA_DRIFT_SIM`, fill the field with one tier's cars only. |
