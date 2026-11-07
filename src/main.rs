@@ -1147,80 +1147,96 @@ fn setup_garage(
         ));
     }
 
-    commands.spawn((
-        DespawnOnExit(GameState::Garage),
-        Node {
-            width: percent(100),
-            height: percent(100),
-            flex_direction: FlexDirection::Column,
-            align_items: AlignItems::Center,
-            justify_content: JustifyContent::SpaceBetween,
-            padding: UiRect::vertical(px(4)),
-            ..default()
-        },
-    ))
-    .with_children(|root| {
-        root.spawn((
-            Text::new("CHOOSE YOUR RIDE"),
-            TextFont { font_size: FontSize::Px(40.0), ..default() },
-            TextColor(Color::srgb(0.95, 0.8, 0.3)),
-        ));
-        root.spawn(Node {
-            width: px(940),
-            flex_direction: FlexDirection::Column,
-            row_gap: px(12),
-            margin: UiRect::bottom(px(52)),
-            ..default()
-        })
-        .with_children(|panel| {
-            panel.spawn((
-                GarageInfo,
-                Text::new(""),
-                TextFont { font_size: FontSize::Px(22.0), ..default() },
-                TextColor(Color::WHITE),
-            ));
-            // Stat bars in two columns: a label, a dark track and a coloured fill.
-            panel
-                .spawn(Node { flex_wrap: FlexWrap::Wrap, row_gap: px(9), column_gap: px(40), ..default() })
-                .with_children(|rows| {
-                    for (i, (name, color, _)) in STATS.iter().enumerate() {
-                        rows.spawn(Node { align_items: AlignItems::Center, column_gap: px(14), ..default() })
-                            .with_children(|row| {
-                                row.spawn((
-                                    Text::new(*name),
-                                    TextFont { font_size: FontSize::Px(20.0), ..default() },
-                                    TextColor(Color::srgb(0.85, 0.85, 0.85)),
-                                    Node { width: px(115), ..default() },
-                                ));
-                                row.spawn((
-                                    Node {
-                                        width: px(290),
-                                        height: px(22),
-                                        border: UiRect::all(px(1)),
-                                        padding: UiRect::all(px(2)),
-                                        ..default()
-                                    },
-                                    BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.45)),
-                                    BorderColor::all(Color::srgba(1.0, 1.0, 1.0, 0.25)),
-                                ))
-                                .with_children(|track| {
-                                    track.spawn((
-                                        StatFill(i),
-                                        Node { width: percent(50), height: percent(100), ..default() },
-                                        BackgroundColor(*color),
-                                    ));
-                                });
-                            });
-                    }
+    // The showroom is laid out for 1280x800 and fitted into the middle of the
+    // window (see `camera_follow`), so the text goes in a box of that size in
+    // the middle too, not against the window's edges: otherwise a window of a
+    // different shape (a browser tab, say) moves it off the showroom floor.
+    commands
+        .spawn((
+            DespawnOnExit(GameState::Garage),
+            Node {
+                width: percent(100),
+                height: percent(100),
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::Center,
+                ..default()
+            },
+        ))
+        .with_children(|screen| {
+            screen
+                .spawn(Node {
+                    width: px(1280),
+                    height: px(800),
+                    flex_shrink: 0.0,
+                    flex_direction: FlexDirection::Column,
+                    align_items: AlignItems::Center,
+                    justify_content: JustifyContent::SpaceBetween,
+                    padding: UiRect::vertical(px(4)),
+                    ..default()
+                })
+                .with_children(|root| {
+                root.spawn((
+                    Text::new("CHOOSE YOUR RIDE"),
+                    TextFont { font_size: FontSize::Px(40.0), ..default() },
+                    TextColor(Color::srgb(0.95, 0.8, 0.3)),
+                ));
+                root.spawn(Node {
+                    width: px(940),
+                    flex_direction: FlexDirection::Column,
+                    row_gap: px(12),
+                    margin: UiRect::bottom(px(52)),
+                    ..default()
+                })
+                .with_children(|panel| {
+                    panel.spawn((
+                        GarageInfo,
+                        Text::new(""),
+                        TextFont { font_size: FontSize::Px(22.0), ..default() },
+                        TextColor(Color::WHITE),
+                    ));
+                    // Stat bars in two columns: a label, a dark track and a coloured fill.
+                    panel
+                        .spawn(Node { flex_wrap: FlexWrap::Wrap, row_gap: px(9), column_gap: px(40), ..default() })
+                        .with_children(|rows| {
+                            for (i, (name, color, _)) in STATS.iter().enumerate() {
+                                rows.spawn(Node { align_items: AlignItems::Center, column_gap: px(14), ..default() })
+                                    .with_children(|row| {
+                                        row.spawn((
+                                            Text::new(*name),
+                                            TextFont { font_size: FontSize::Px(20.0), ..default() },
+                                            TextColor(Color::srgb(0.85, 0.85, 0.85)),
+                                            Node { width: px(115), ..default() },
+                                        ));
+                                        row.spawn((
+                                            Node {
+                                                width: px(290),
+                                                height: px(22),
+                                                border: UiRect::all(px(1)),
+                                                padding: UiRect::all(px(2)),
+                                                ..default()
+                                            },
+                                            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.45)),
+                                            BorderColor::all(Color::srgba(1.0, 1.0, 1.0, 0.25)),
+                                        ))
+                                        .with_children(|track| {
+                                            track.spawn((
+                                                StatFill(i),
+                                                Node { width: percent(50), height: percent(100), ..default() },
+                                                BackgroundColor(*color),
+                                            ));
+                                        });
+                                    });
+                            }
+                        });
+                    panel.spawn((
+                        GarageHelp,
+                        Text::new(""),
+                        TextFont { font_size: FontSize::Px(18.0), ..default() },
+                        TextColor(Color::srgb(0.65, 0.65, 0.65)),
+                    ));
                 });
-            panel.spawn((
-                GarageHelp,
-                Text::new(""),
-                TextFont { font_size: FontSize::Px(18.0), ..default() },
-                TextColor(Color::srgb(0.65, 0.65, 0.65)),
-            ));
+                });
         });
-    });
 }
 
 /// Where a model sits between the weakest and strongest of all models on a
