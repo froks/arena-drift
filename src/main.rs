@@ -57,6 +57,8 @@ const WRECK_SPIN_DAMPING: f32 = 2.0;
 const DAMAGE_THRESHOLD: f32 = 70.0; // impact speed below this does no damage
 const DAMAGE_SCALE: f32 = 0.16;
 const WALL_DAMAGE_SCALE: f32 = 0.05;
+/// Races are about speed, not survival: crashes do this much of their derby damage.
+const RACE_CRASH_DAMAGE: f32 = 0.35;
 
 const AI_CARS: usize = 5;
 /// Cars in a race, the player included.
@@ -222,11 +224,13 @@ struct Ai {
     aggression: f32,
     /// Racing: where across the track it's aiming (offset from the centreline).
     lane: f32,
+    /// Racing: how much throttle it uses on the straights (1 = flat out).
+    pace: f32,
 }
 
 impl Ai {
     fn new(player_bias: f32, aggression: f32) -> Self {
-        Self { stuck: 0.0, reversing: 0.0, player_bias, aggression, lane: 0.0 }
+        Self { stuck: 0.0, reversing: 0.0, player_bias, aggression, lane: 0.0, pace: 1.0 }
     }
 }
 
@@ -542,6 +546,7 @@ fn main() {
             size: if cfg!(target_arch = "wasm32") { 2048 } else { 4096 },
         })
         .init_resource::<MenuChoice>()
+        .init_resource::<LastInput>()
         // Dev shortcut: ARENA_DRIFT_AUTOSTART=1 skips the menu and garage.
         .insert_state(if autostart { GameState::Playing } else { GameState::Menu })
         .init_resource::<CarArt>()
@@ -549,6 +554,7 @@ fn main() {
         .init_resource::<ArenaArt>()
         .add_systems(Startup, setup_world)
         .add_systems(Update, dev_screenshot)
+        .add_systems(PreUpdate, gamepad_menu_keys.after(bevy::input::InputSystems))
         .add_systems(OnEnter(GameState::Menu), setup_menu)
         .add_systems(Update, menu_input.run_if(in_state(GameState::Menu)))
         .add_systems(OnEnter(GameState::Garage), setup_garage)
@@ -749,12 +755,13 @@ fn start_round(
     blasts.0.clear();
 
     let grid = match &track {
-        // The player starts from the back of the grid.
+        // The player starts third, with one rival behind.
         Some(t) => {
             let slots = t.grid(lineup.len());
             let mut order: Vec<usize> = (0..lineup.len()).collect();
             if sim.is_none() {
-                order.rotate_left(1);
+                let player = order.remove(0);
+                order.insert(2.min(order.len()), player);
             }
             let mut grid = vec![(Vec2::ZERO, 0.0); lineup.len()];
             for (slot, &car) in order.iter().enumerate() {
@@ -803,8 +810,8 @@ fn start_round(
         } else if sim.is_some() {
             commands.entity(root).insert(Ai::new(1.0, 0.9));
         } else if track.is_some() {
-            // Racers differ in how hard they push through corners.
-            commands.entity(root).insert(Ai::new(1.0, 0.86 + 0.08 * t));
+            // Racers differ in how hard they push, but none drives flat out.
+            commands.entity(root).insert(Ai { pace: 0.82 + 0.08 * t, ..Ai::new(1.0, 0.78 + 0.1 * t) });
         } else {
             commands.entity(root).insert(Ai::new(0.6 + 0.3 * t, 0.75 + 0.25 * (1.0 - t)));
         }
@@ -933,7 +940,7 @@ fn setup_menu(mut commands: Commands, mut terrain: ResMut<Terrain>, old: Query<E
                 ));
             }
             root.spawn((
-                Text::new("Up/Down choose  |  Enter select"),
+                Text::new("Up/Down choose  |  Enter select  (gamepad: D-pad, A)"),
                 TextFont { font_size: FontSize::Px(20.0), ..default() },
                 TextColor(Color::srgb(0.6, 0.6, 0.6)),
                 Node { margin: UiRect::top(px(30)), ..default() },
@@ -1127,7 +1134,8 @@ fn garage_input(
          Handling   {}\n\
          Toughness  {}\n\
          Weight     {}\n\n\
-         Up/Down tier  |  Left/Right car  |  Enter/Space start  |  Esc menu",
+         Up/Down tier  |  Left/Right car  |  Enter/Space start  |  Esc menu\n\
+         Gamepad: D-pad choose  |  Y change {}  |  A start  |  B menu",
         m.tier,
         m.name.to_uppercase(),
         m.blurb,
@@ -1139,6 +1147,7 @@ fn garage_input(
         stat_bar(handling(m), handling),
         stat_bar(toughness(m), toughness),
         stat_bar(m.mass, |m| m.mass),
+        if def.is_race() { "track" } else { "arena" },
     );
 }
 
@@ -1175,6 +1184,8 @@ fn garage_animate(
 
 fn player_input(
     keys: Res<ButtonInput<KeyCode>>,
+    pads: Query<&Gamepad>,
+    mut last: ResMut<LastInput>,
     mut q: Query<(&mut Car, &mut Armory), With<Player>>,
 ) {
     let Ok((mut car, mut armory)) = q.single_mut() else { return };
@@ -1198,19 +1209,118 @@ fn player_input(
     if pressed(KeyCode::KeyD, KeyCode::ArrowRight) {
         steer -= 1.0;
     }
-    car.throttle = throttle;
-    car.steer = steer;
-    car.handbrake = keys.pressed(KeyCode::Space);
+    let mut handbrake = keys.pressed(KeyCode::Space);
+    let mut fire = false;
+    // Gamepads, all analog: the left stick steers (left/right) and drives
+    // (up = throttle, down = brake/reverse); the triggers also work as
+    // throttle and brake. A or RB fires, B or LB is the handbrake.
+    let mut pad_used = false;
+    for pad in &pads {
+        let stick = pad.left_stick();
+        let x = stick_axis(stick.x, STICK_DEADZONE);
+        // Responsive right from the middle, flattening out towards full lock.
+        let pad_steer = -x.signum() * x.abs().powf(STEER_CURVE);
+        // A slightly bigger dead zone for throttle, so steering hard doesn't
+        // also brake.
+        let y = stick_axis(stick.y, 0.2);
+        let pad_throttle = y.signum() * y.abs().powf(STEER_CURVE)
+            + pad.get(GamepadButton::RightTrigger2).unwrap_or(0.0)
+            - pad.get(GamepadButton::LeftTrigger2).unwrap_or(0.0);
+        let pad_handbrake = pad.pressed(GamepadButton::East) || pad.pressed(GamepadButton::LeftTrigger);
+        let pad_fire = pad.pressed(GamepadButton::South) || pad.pressed(GamepadButton::RightTrigger);
+        steer += pad_steer;
+        throttle += pad_throttle;
+        handbrake |= pad_handbrake;
+        fire |= pad_fire;
+        pad_used |= pad_steer != 0.0 || pad_throttle.abs() > 0.05 || pad_handbrake || pad_fire;
+    }
+    if pad_used {
+        last.0 = InputDevice::Gamepad;
+    } else if keys.get_pressed().next().is_some() {
+        last.0 = InputDevice::Keyboard;
+    }
+    car.throttle = throttle.clamp(-1.0, 1.0);
+    car.steer = steer.clamp(-1.0, 1.0);
+    car.handbrake = handbrake;
     // Ctrl suits arrow-key driving. In the browser, Ctrl+W (W held for throttle)
     // would close the tab; pages can't block that, so index.html asks before
     // leaving instead.
-    armory.fire = keys.any_pressed([
-        KeyCode::KeyF,
-        KeyCode::KeyC,
-        KeyCode::KeyV,
-        KeyCode::ControlLeft,
-        KeyCode::ControlRight,
-    ]);
+    armory.fire = fire
+        || keys.any_pressed([
+            KeyCode::KeyF,
+            KeyCode::KeyC,
+            KeyCode::KeyV,
+            KeyCode::ControlLeft,
+            KeyCode::ControlRight,
+        ]);
+}
+
+/// Stick movement smaller than this is ignored (worn sticks drift a little).
+const STICK_DEADZONE: f32 = 0.1;
+/// Stick response curve: below 1 reacts strongly to small movements and
+/// changes less near the edge.
+const STEER_CURVE: f32 = 0.85;
+
+/// A stick axis with a dead zone, rescaled to still reach ±1.
+fn stick_axis(v: f32, deadzone: f32) -> f32 {
+    if v.abs() <= deadzone { 0.0 } else { v.signum() * ((v.abs() - deadzone) / (1.0 - deadzone)).min(1.0) }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum InputDevice {
+    #[default]
+    Keyboard,
+    Gamepad,
+}
+
+/// What the player drove with last, for showing the right control hints.
+#[derive(Resource, Default)]
+struct LastInput(InputDevice);
+
+/// Menus are driven by keys, so gamepad buttons press the matching keys:
+/// D-pad (or the left stick outside races) for arrows, A / Start for Enter,
+/// B for Esc and Y / Select for Tab.
+fn gamepad_menu_keys(
+    state: Res<State<GameState>>,
+    pads: Query<&Gamepad>,
+    mut keys: ResMut<ButtonInput<KeyCode>>,
+    mut held: Local<Vec<KeyCode>>,
+) {
+    let mut want = Vec::new();
+    for pad in &pads {
+        let mut dir = pad.dpad();
+        // While driving the stick steers by itself; arrows would mean full lock.
+        if *state.get() != GameState::Playing {
+            let stick = pad.left_stick();
+            if stick.length() > 0.6 {
+                dir += stick;
+            }
+        }
+        for (on, key) in [
+            (dir.y > 0.5, KeyCode::ArrowUp),
+            (dir.y < -0.5, KeyCode::ArrowDown),
+            (dir.x < -0.5, KeyCode::ArrowLeft),
+            (dir.x > 0.5, KeyCode::ArrowRight),
+            (pad.pressed(GamepadButton::South) || pad.pressed(GamepadButton::Start), KeyCode::Enter),
+            (pad.pressed(GamepadButton::East), KeyCode::Escape),
+            (pad.pressed(GamepadButton::North) || pad.pressed(GamepadButton::Select), KeyCode::Tab),
+        ] {
+            if on && !want.contains(&key) {
+                want.push(key);
+            }
+        }
+    }
+    for &key in &want {
+        if !held.contains(&key) {
+            keys.press(key);
+        }
+    }
+    for &key in held.iter() {
+        if !want.contains(&key) {
+            keys.release(key);
+        }
+    }
+    *held = want;
 }
 
 /// Derby AI: hunt the other cars, grab power-ups on the way.
@@ -1404,6 +1514,8 @@ fn ai_race(
         ais.iter().map(|(e, t, c, _, _, r)| (e, t.translation.truncate(), r.progress, r.lateral, c.alive())),
     );
     let pickups: Vec<(Vec2, PickupKind)> = pickups.iter().map(|(t, p)| (t.translation.truncate(), p.0)).collect();
+    // The player, while still racing (`others` only holds non-AI cars).
+    let player = others.iter().find(|(_, _, c, r)| c.alive() && r.finish.is_none()).map(|(.., r)| r.progress);
 
     for (me, tf, mut car, mut ai, mut armory, racer) in &mut ais {
         armory.fire = false;
@@ -1470,6 +1582,14 @@ fn ai_race(
             continue;
         }
 
+        // Rubber band: ease off when well ahead of the player, push a little
+        // harder when well behind, so races stay close.
+        let pace = match player {
+            Some(p) if s > p => ai.pace - 0.15 * ((s - p) / 1200.0).min(1.0),
+            Some(p) => (ai.pace + 0.1 * ((p - s) / 1200.0).min(1.0)).min(1.0),
+            None => ai.pace,
+        };
+
         // Fastest speed that still makes every bend coming up, given room to brake.
         let brake = 650.0;
         let allowed = (0..16)
@@ -1478,7 +1598,8 @@ fn ai_race(
                 let v = corner_speed(car.model, track.curvature_at(s + d), ai.aggression);
                 (v * v + 2.0 * brake * d).sqrt()
             })
-            .fold(f32::MAX, f32::min);
+            .fold(f32::MAX, f32::min)
+            .min(car.model.top_speed * pace);
         car.steer = (diff * 3.0).clamp(-1.0, 1.0);
         car.throttle = if diff.abs() > 1.4 {
             0.6 // pointing the wrong way: turn round
@@ -1487,7 +1608,7 @@ fn ai_race(
         } else if speed > allowed {
             0.2
         } else {
-            1.0
+            pace
         };
         car.handbrake = diff.abs() > 1.0 && speed > 220.0;
 
@@ -1681,9 +1802,11 @@ fn static_collisions(
     art: Res<Art>,
     mut rng: ResMut<Rng>,
     mut sounds: ResMut<Sounds>,
+    race: Option<Res<Race>>,
     mut cars: Query<(&mut Transform, &mut Car, Has<Player>)>,
     mut obstacles: Query<(&Obstacle, Option<&mut Explosive>)>,
 ) {
+    let scale = if race.is_some() { RACE_CRASH_DAMAGE } else { 1.0 };
     for (mut tf, mut car, is_player) in &mut cars {
         let reach = car.model.size.length() / 2.0;
         // (impact speed, damage factor, contact point, outward normal)
@@ -1721,7 +1844,7 @@ fn static_collisions(
             sounds.play(Sfx::Crash, (impact / 600.0) * soft * if is_player { 1.0 } else { 0.5 });
         }
         if impact > DAMAGE_THRESHOLD * 1.5 && car.alive() {
-            let dmg = (impact - DAMAGE_THRESHOLD * 1.5) * WALL_DAMAGE_SCALE * factor / car.model.armor;
+            let dmg = (impact - DAMAGE_THRESHOLD * 1.5) * WALL_DAMAGE_SCALE * factor * scale / car.model.armor;
             car.hp -= dmg;
             spawn_sparks(&mut commands, &art, &mut rng, point.extend(tf.translation.z + 8.0), normal.perp(), impact * factor.min(1.0));
         }
@@ -1780,8 +1903,10 @@ fn car_collisions(
     mut rng: ResMut<Rng>,
     mut score: ResMut<Score>,
     mut sounds: ResMut<Sounds>,
+    race: Option<Res<Race>>,
     mut q: Query<(&mut Transform, &mut Car, Has<Player>)>,
 ) {
+    let scale = if race.is_some() { RACE_CRASH_DAMAGE } else { 1.0 };
     let mut combos = q.iter_combinations_mut();
     while let Some([(mut ta, mut a, a_player), (mut tb, mut b, b_player)]) = combos.fetch_next() {
         let (pa, pb) = (ta.translation.truncate(), tb.translation.truncate());
@@ -1816,7 +1941,7 @@ fn car_collisions(
         // off hits from light ones. Normalised so a centred hit between equal
         // masses behaves as "closing speed".
         let jolt = |m: f32| (j / m) / ((1.0 + RESTITUTION) / 2.0);
-        let dmg = |m: f32| (jolt(m) - DAMAGE_THRESHOLD).max(0.0) * DAMAGE_SCALE;
+        let dmg = |m: f32| (jolt(m) - DAMAGE_THRESHOLD).max(0.0) * DAMAGE_SCALE * scale;
         // Hitting with your nose is good, taking it in the side is bad.
         let a_front = a.forward().dot(n).max(0.0);
         let b_front = b.forward().dot(-n).max(0.0);
@@ -2558,9 +2683,14 @@ fn update_hud(
     track: Option<Res<Track>>,
     race: Option<Res<Race>>,
     cars: Query<(Entity, &Car, &Armory, Has<Player>, Option<&Racer>)>,
+    last: Res<LastInput>,
     mut hud: Query<&mut Text, With<Hud>>,
 ) {
     let Ok(mut text) = hud.single_mut() else { return };
+    let help = match last.0 {
+        InputDevice::Keyboard => "W/S or arrows drive  |  Space handbrake  |  Ctrl or F/C/V fire",
+        InputDevice::Gamepad => "Left stick or RT/LT drive  |  B/LB handbrake  |  A/RB fire",
+    };
     let Some((player, car, armory, _, racer)) = cars.iter().find(|(.., p, _)| *p) else { return };
 
     let weapon_text = if armory.weapon == Weapon::None {
@@ -2591,14 +2721,14 @@ fn update_hud(
     };
 
     text.0 = format!(
-        "{}  HP {:>3.0}/{:.0}   Weapon {}{}   {}\n\
-         W/S or arrows drive  |  Space handbrake  |  Ctrl or F/C/V fire",
+        "{}  HP {:>3.0}/{:.0}   Weapon {}{}   {}\n{}",
         car.model.name,
         car.hp.max(0.0),
         car.model.max_hp,
         weapon_text,
         turbo_text,
         status,
+        help,
     );
 }
 
@@ -2703,13 +2833,20 @@ fn ordinal(n: usize) -> String {
     format!("{n}{suffix}")
 }
 
+/// When the game-over screen appeared; input is ignored for a moment so a
+/// fire button still held from the race doesn't start a rematch.
+#[derive(Resource)]
+struct GameOverAt(f32);
+
 fn show_game_over(
+    time: Res<Time<Real>>,
     mut commands: Commands,
     score: Res<Score>,
     mut sounds: ResMut<Sounds>,
     sim: Option<Res<Sim>>,
     race: Option<Res<Race>>,
 ) {
+    commands.insert_resource(GameOverAt(time.elapsed_secs()));
     if sim.is_some() {
         return;
     }
@@ -2766,6 +2903,8 @@ fn show_game_over(
 }
 
 fn game_over_input(
+    time: Res<Time<Real>>,
+    shown: Option<Res<GameOverAt>>,
     keys: Res<ButtonInput<KeyCode>>,
     mut next: ResMut<NextState<GameState>>,
     sim: Option<Res<Sim>>,
@@ -2791,6 +2930,9 @@ fn game_over_input(
         }
         eprintln!("SIM   draws          {:>3}", sim.draws);
         exit.write(AppExit::Success);
+        return;
+    }
+    if shown.is_some_and(|t| time.elapsed_secs() - t.0 < 1.0) {
         return;
     }
     if keys.just_pressed(KeyCode::Enter) {

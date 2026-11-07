@@ -51,7 +51,7 @@ jobs:
       # ALSA headers for sound; everything else Bevy needs is loaded at runtime.
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libasound2-dev
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libasound2-dev libudev-dev
 
       - name: Build
         run: cargo build --release --locked

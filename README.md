@@ -75,6 +75,20 @@ build it yourself (see below).
 | | G | Back to the garage |
 | | M / Esc | Back to the menu |
 
+**Gamepads** work too, natively and in the browser (browsers only report a controller after you press one of its
+buttons):
+
+| Where | Control | Action |
+|---|---|---|
+| Driving | Left stick | Steer (left/right) and throttle / brake (up/down), both analog |
+| | Right / left trigger | Throttle / brake and reverse (analog) |
+| | A or RB | Fire |
+| | B or LB | Handbrake |
+| Menus | D-pad or left stick | Choose |
+| | A or Start | Confirm |
+| | B | Back |
+| | Y or Select | Change arena or track |
+
 ## Building and running
 
 You need **Rust 1.88 or newer**. The easiest way to get it is [rustup](https://rustup.rs).
@@ -91,21 +105,22 @@ use `cargo run --release`.
 
 ### System dependencies
 
-Bevy's features are cut down in `Cargo.toml` (no gamepad or Wayland support), so the list of system packages is
-short.
+Bevy's features are cut down in `Cargo.toml` (no Wayland support), so the list of system packages is short.
 
 **Linux (Debian / Ubuntu):**
 
 ```sh
-sudo apt install pkg-config libasound2-dev
+sudo apt install pkg-config libasound2-dev libudev-dev
 ```
 
+- `libudev-dev` is needed for gamepad support.
 - `libasound2-dev` (ALSA) is needed for sound. PipeWire and PulseAudio systems work through their ALSA
   compatibility layer.
 - At runtime you need a Vulkan-capable GPU driver (Mesa works) and an X11 session. On Wayland desktops the game runs
   through XWayland.
 
-Other distributions need the equivalent packages, for example `alsa-lib-devel` on Fedora and `alsa-lib` on Arch.
+Other distributions need the equivalent packages, for example `alsa-lib-devel` and `systemd-devel` on Fedora, or
+`alsa-lib` and `systemd-libs` on Arch.
 
 **Windows / macOS:** no extra packages should be needed, but these platforms haven't been tested yet.
 
