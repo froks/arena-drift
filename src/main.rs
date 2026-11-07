@@ -864,7 +864,10 @@ fn player_input(
     car.throttle = throttle;
     car.steer = steer;
     car.handbrake = keys.pressed(KeyCode::Space);
-    armory.fire = pressed(KeyCode::KeyF, KeyCode::ControlLeft);
+    // Left Ctrl fires only in native builds: in the browser, Ctrl+W (with W held for
+    // throttle) closes the tab, and pages are not allowed to prevent that shortcut.
+    armory.fire = keys.any_pressed([KeyCode::KeyF, KeyCode::KeyC, KeyCode::KeyV])
+        || (cfg!(not(target_arch = "wasm32")) && keys.pressed(KeyCode::ControlLeft));
 }
 
 fn ai_drive(
@@ -1837,7 +1840,7 @@ fn update_hud(
 
     text.0 = format!(
         "{}  HP {:>3.0}/{:.0}   Weapon {}{}   Rivals {}   Wrecked {}   Score {:.0}\n\
-         W/S throttle  |  A/D steer  |  Space handbrake  |  F fire",
+         W/S throttle  |  A/D steer  |  Space handbrake  |  F/C/V fire",
         car.model.name,
         car.hp.max(0.0),
         car.model.max_hp,

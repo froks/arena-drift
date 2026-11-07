@@ -51,7 +51,7 @@ build it yourself (see below).
 | | S / Down | Brake, then reverse |
 | | A / D or Left / Right | Steer |
 | | Space | Handbrake |
-| | F or Left Ctrl | Fire the current weapon |
+| | F, C or V (or Left Ctrl, native builds only) | Fire the current weapon |
 | After a match | Enter | Rematch |
 | | G | Back to the garage |
 
