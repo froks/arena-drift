@@ -486,6 +486,33 @@ pub fn roof_height(model: &CarModel) -> f32 {
     p.body_top + p.cabin_h
 }
 
+/// Where weapons sit on a model, in the car's own frame (x forward, y left,
+/// z up): the twin guns either side of the bonnet, the rocket pod on the roof,
+/// the mine rack on the back.
+pub struct WeaponSpots {
+    /// Gun mounts (one each side: use `gun.y` and `-gun.y`).
+    pub gun: Vec3,
+    pub rockets: Vec3,
+    pub mines: Vec3,
+}
+
+pub fn weapon_spots(model: &CarModel) -> WeaponSpots {
+    let p = Proportions::of(model);
+    let hl = model.size / 2.0;
+    let (cabin_x, cabin_half, _) = model.look.cabin;
+    let roof_x = cabin_x * hl.x;
+    // The mine rack sits on the tail, or on the roof if the cabin reaches back
+    // that far (estates, vans).
+    let mines_x = -hl.x * 0.72;
+    let under_roof = (mines_x / hl.x - cabin_x).abs() < cabin_half + 0.15;
+    let mines_z = if under_roof { p.body_top + p.cabin_h } else { p.body_top };
+    WeaponSpots {
+        gun: Vec3::new(hl.x * 0.5, hl.y * 0.62, p.body_top),
+        rockets: Vec3::new(roof_x, 0.0, p.body_top + p.cabin_h),
+        mines: Vec3::new(mines_x, 0.0, mines_z),
+    }
+}
+
 /// Vertical layout of a model, in world units.
 struct Proportions {
     wheel_r: f32,

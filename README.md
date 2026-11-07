@@ -47,7 +47,11 @@ build it yourself (see below).
     fade out while you drive under them.
 - **Obstacles that behave differently.** Tire stacks are bouncy and soft, concrete and rock hurt, and red barrels
   explode (shoot them, ram them, or set off a chain reaction).
-- **Power-ups:** health packs, a machine gun, rockets, mines and turbo.
+- **Power-ups:** health packs, twin machine guns, rockets, mines and turbo. Whatever a car carries is mounted on it:
+  guns either side of the bonnet (they fire in turn), a rocket pod on the roof, a stack of mines on the back.
+- **HUD:** your position (or rivals left) big in the top left with the times, the lap in the middle, your weapon as
+  a coloured badge on the right and a health bar bottom left. Laps, best laps, pickups and wrecks pop up in the
+  middle of the screen.
 - **Camera and minimap.** The camera follows your car and zooms out with speed, a minimap shows the whole arena,
   and sliding cars leave skid marks.
 - **Generated synthpop soundtrack.** Every arena and track has its own fast synthpop song (four-on-the-floor

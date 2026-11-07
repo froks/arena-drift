@@ -220,13 +220,19 @@ struct Armory {
     fire: bool,
     /// Seconds of turbo left.
     turbo: f32,
+    /// Which of the twin guns fires next (they take turns).
+    left_gun: bool,
 }
 
 impl Default for Armory {
     fn default() -> Self {
-        Self { weapon: Weapon::None, ammo: 0, cooldown: 0.0, fire: false, turbo: 0.0 }
+        Self { weapon: Weapon::None, ammo: 0, cooldown: 0.0, fire: false, turbo: 0.0, left_gun: true }
     }
 }
+
+/// A weapon mounted on a car, shown only while the car carries that weapon.
+#[derive(Component)]
+struct WeaponMount(Weapon);
 
 #[derive(Component)]
 struct Player;
@@ -392,8 +398,45 @@ struct Explosion {
 #[derive(Component)]
 struct RoundEntity;
 
+/// HUD parts, updated by `update_hud`.
 #[derive(Component)]
-struct Hud;
+enum Hud {
+    /// Top left, big: race position, or rivals left in a derby.
+    Main,
+    /// Under it: times, or wrecks and score.
+    Sub,
+    /// Top centre: the lap.
+    Lap,
+    /// Top right: the weapon badge and its text.
+    WeaponBadge,
+    WeaponText,
+    Turbo,
+    /// Bottom left: the health bar's fill.
+    Health,
+    /// Bottom centre: the controls, for the first seconds of a round.
+    Help,
+}
+
+/// Short messages that pop up in the middle of the screen: laps, pickups,
+/// wrecks.
+#[derive(Resource, Default)]
+struct Announcements {
+    queue: VecDeque<String>,
+    /// The one on screen and how long it has been there.
+    showing: Option<(String, f32)>,
+}
+
+impl Announcements {
+    fn say(&mut self, text: impl Into<String>) {
+        self.queue.push_back(text.into());
+    }
+}
+
+#[derive(Component)]
+struct AnnouncementText;
+
+/// How long a pop-up message stays up.
+const ANNOUNCE_SECS: f32 = 1.5;
 
 #[derive(Resource, Default)]
 struct Score {
@@ -492,6 +535,14 @@ struct Art {
     white_mat: Handle<StandardMaterial>,
     spray_mat: Handle<StandardMaterial>,
     ripple_mat: Handle<StandardMaterial>,
+    cube: Handle<Mesh>,
+    /// Upright cylinder (axis along Z).
+    disc: Handle<Mesh>,
+    gun_metal: Handle<StandardMaterial>,
+    pod_red: Handle<StandardMaterial>,
+    rocket_tip: Handle<StandardMaterial>,
+    mine_red: Handle<StandardMaterial>,
+    mine_light: Handle<StandardMaterial>,
 }
 
 /// Tiny xorshift RNG so we don't need an extra crate.
@@ -568,6 +619,7 @@ fn main() {
         })
         .init_resource::<MenuChoice>()
         .init_resource::<LastInput>()
+        .init_resource::<Announcements>()
         // Dev shortcut: ARENA_DRIFT_AUTOSTART=1 skips the menu and garage.
         .insert_state(if autostart {
             GameState::Playing
@@ -641,6 +693,8 @@ fn main() {
                 river_ripples.run_if(resource_exists::<Track>),
                 update_droplets,
                 (attach_health_bars, update_health_bars).chain().after(follow_terrain),
+                (attach_weapon_mounts, show_weapon_mounts).chain(),
+                show_announcements,
                 camera_follow.after(follow_terrain),
             ),
         )
@@ -755,6 +809,18 @@ fn setup_world(
         spray_mat: materials.add(StandardMaterial { depth_bias: 40.0, ..glow(Color::srgba(0.93, 0.97, 1.0, 0.9)) }),
         // Drawn after the water and the ford's gravel.
         ripple_mat: materials.add(StandardMaterial { depth_bias: 40.0, ..glow(Color::srgba(0.85, 0.95, 1.0, 0.3)) }),
+        cube: meshes.add(Cuboid::new(1.0, 1.0, 1.0)),
+        disc: meshes.add(Mesh::from(Cylinder::new(1.0, 1.0)).rotated_by(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2))),
+        gun_metal: materials.add(StandardMaterial {
+            base_color: Color::srgb(0.16, 0.16, 0.18),
+            perceptual_roughness: 0.35,
+            metallic: 0.6,
+            ..default()
+        }),
+        pod_red: materials.add(StandardMaterial { base_color: Color::srgb(0.75, 0.18, 0.12), perceptual_roughness: 0.5, ..default() }),
+        rocket_tip: materials.add(StandardMaterial { base_color: Color::srgb(0.92, 0.92, 0.9), perceptual_roughness: 0.5, ..default() }),
+        mine_red: materials.add(StandardMaterial { base_color: Color::srgb(0.7, 0.12, 0.12), perceptual_roughness: 0.6, ..default() }),
+        mine_light: materials.add(glow(Color::srgb(1.0, 0.85, 0.2))),
     });
 }
 
@@ -883,24 +949,7 @@ fn start_round(
     if sim.is_some() {
         return; // no player, no HUD
     }
-    commands.spawn((
-        RoundEntity,
-        Hud,
-        Text::new(""),
-        TextFont {
-            font_size: FontSize::Px(22.0),
-            ..default()
-        },
-        TextColor(Color::WHITE),
-        BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.55)),
-        Node {
-            position_type: PositionType::Absolute,
-            top: px(8),
-            left: px(12),
-            padding: UiRect::axes(px(8), px(4)),
-            ..default()
-        },
-    ));
+    spawn_hud(&mut commands);
     // "3, 2, 1, GO!" in big letters.
     commands.spawn((
         RoundEntity,
@@ -2057,6 +2106,7 @@ fn track_progress(
     track: Res<Track>,
     race: Res<Race>,
     mut sounds: ResMut<Sounds>,
+    mut news: ResMut<Announcements>,
     mut cars: Query<(&Transform, &Car, &mut Racer, Has<Player>)>,
 ) {
     if !race.started() {
@@ -2075,10 +2125,16 @@ fn track_progress(
         }
         if racer.laps_done(&track) > laps_before {
             let lap = race.clock - racer.lap_start;
+            let best = racer.best_lap.is_some_and(|b| lap < b);
             racer.best_lap = Some(racer.best_lap.map_or(lap, |b| b.min(lap)));
             racer.lap_start = race.clock;
             if is_player && racer.progress < full {
                 sounds.play(Sfx::Beep, 0.5);
+                let next = racer.laps_done(&track) + 1;
+                if best {
+                    news.say(format!("BEST LAP {}", race_time(lap)));
+                }
+                news.say(if next == track.laps { "FINAL LAP".to_string() } else { format!("LAP {next}/{}", track.laps) });
             }
         }
         if racer.progress >= full {
@@ -2636,7 +2692,7 @@ fn fire_weapons(
             continue;
         }
 
-        let nose = pos + fwd * (half_len + 8.0);
+        let spots = cars::weapon_spots(car.model);
         let fwd_speed = car.vel.dot(fwd).max(0.0);
         let vol = if is_player { 1.0 } else { 0.45 };
         match armory.weapon {
@@ -2644,7 +2700,11 @@ fn fire_weapons(
             Weapon::Guns => {
                 sounds.play_at(Sfx::Gun, vol * 0.6, pos);
                 armory.cooldown = GUN_COOLDOWN;
-                let dir = fwd.rotate(Vec2::from_angle(rng.range(-0.04, 0.04)));
+                // The twin guns take turns.
+                let side = if armory.left_gun { 1.0 } else { -1.0 };
+                armory.left_gun = !armory.left_gun;
+                let nose = pos + fwd * (spots.gun.x + 16.0) + fwd.perp() * side * spots.gun.y;
+                let dir = fwd.rotate(Vec2::from_angle(rng.range(-0.03, 0.03)));
                 let vel = dir * (GUN_SPEED + fwd_speed);
                 commands.spawn((
                     RoundEntity,
@@ -2658,6 +2718,8 @@ fn fire_weapons(
             Weapon::Rockets => {
                 sounds.play_at(Sfx::Rocket, vol, pos);
                 armory.cooldown = ROCKET_COOLDOWN;
+                // Out of the roof pod.
+                let nose = pos + fwd * (spots.rockets.x + 12.0);
                 let vel = fwd * (ROCKET_START_SPEED + fwd_speed);
                 let rocket = commands
                     .spawn((
@@ -2672,7 +2734,7 @@ fn fire_weapons(
             Weapon::Mines => {
                 sounds.play_at(Sfx::MineDrop, vol, pos);
                 armory.cooldown = MINE_COOLDOWN;
-                let tail = pos - fwd * (half_len + 14.0);
+                let tail = pos + fwd * (spots.mines.x - 18.0);
                 let mine = commands
                     .spawn((
                         RoundEntity,
@@ -2950,6 +3012,7 @@ fn spawn_pickups(
 fn collect_pickups(
     mut commands: Commands,
     mut sounds: ResMut<Sounds>,
+    mut news: ResMut<Announcements>,
     pickups: Query<(Entity, &Transform, &Pickup)>,
     mut cars: Query<(&Transform, &mut Car, &mut Armory, Has<Player>)>,
 ) {
@@ -2966,6 +3029,13 @@ fn collect_pickups(
             };
             if is_player {
                 sounds.play(sfx, 0.8);
+                news.say(match pickup.0 {
+                    PickupKind::Health => format!("HEALTH +{HEALTH_PACK:.0}"),
+                    PickupKind::Turbo => "TURBO!".to_string(),
+                    PickupKind::Guns => "MACHINE GUNS".to_string(),
+                    PickupKind::Rockets => "ROCKETS".to_string(),
+                    PickupKind::Mines => "MINES".to_string(),
+                });
             } else {
                 sounds.play_at(sfx, 0.4, ppos);
             }
@@ -3044,10 +3114,11 @@ fn update_car_visuals(
     mut rng: ResMut<Rng>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut sounds: ResMut<Sounds>,
-    mut q: Query<(&Transform, &mut Car, Option<&mut Icon>)>,
+    mut news: ResMut<Announcements>,
+    mut q: Query<(&Transform, &mut Car, Option<&mut Icon>, Has<Player>)>,
 ) {
     let charred = Color::srgb(0.2, 0.17, 0.15);
-    for (tf, mut car, icon) in &mut q {
+    for (tf, mut car, icon, is_player) in &mut q {
         let health = car.health();
         let mix = if car.alive() { 0.35 + 0.65 * health } else { 0.12 };
         for (handle, base) in car.paint.handles.iter().zip(car.paint.colors) {
@@ -3061,6 +3132,9 @@ fn update_car_visuals(
         if !car.alive() && !car.wrecked {
             car.wrecked = true;
             sounds.play_at(Sfx::Wreck, 1.0, tf.translation.truncate());
+            if !is_player {
+                news.say(format!("{} WRECKED", car.model.name.to_uppercase()));
+            }
             if let Some(mut icon) = icon {
                 icon.color = Color::srgb(0.3, 0.3, 0.3);
                 icon.layer = 2;
@@ -3081,6 +3155,62 @@ fn update_car_visuals(
                 Transform::from_translation(pos.extend(tf.translation.z + cars::roof_height(car.model)))
                     .with_scale(Vec3::splat(4.0)),
             ));
+        }
+    }
+}
+
+/// Mount the weapons on every new car: hidden until it picks them up.
+fn attach_weapon_mounts(mut commands: Commands, art: Res<Art>, cars: Query<(Entity, &Car), Added<Car>>) {
+    for (root, car) in &cars {
+        let spots = cars::weapon_spots(car.model);
+        let part = |mesh: &Handle<Mesh>, mat: &Handle<StandardMaterial>, at: Vec3, size: Vec3| {
+            (Mesh3d(mesh.clone()), MeshMaterial3d(mat.clone()), Transform::from_translation(at).with_scale(size))
+        };
+        // Twin machine guns either side of the bonnet: a mount and a barrel.
+        let guns = commands
+            .spawn((WeaponMount(Weapon::Guns), Transform::default(), Visibility::Hidden))
+            .with_children(|g| {
+                for side in [-1.0, 1.0] {
+                    let base = spots.gun * Vec3::new(1.0, side, 1.0);
+                    g.spawn(part(&art.cube, &art.gun_metal, base + Vec3::new(0.0, 0.0, 1.5), Vec3::new(7.0, 4.5, 3.0)));
+                    g.spawn(part(&art.cube, &art.gun_metal, base + Vec3::new(8.5, 0.0, 2.6), Vec3::new(14.0, 2.4, 2.4)));
+                }
+            })
+            .id();
+        // Rocket pod on the roof, two rockets showing at the front.
+        let rockets = commands
+            .spawn((WeaponMount(Weapon::Rockets), Transform::default(), Visibility::Hidden))
+            .with_children(|r| {
+                let at = spots.rockets;
+                r.spawn(part(&art.cube, &art.pod_red, at + Vec3::new(0.0, 0.0, 3.0), Vec3::new(15.0, 11.0, 6.0)));
+                r.spawn(part(&art.cube, &art.gun_metal, at + Vec3::new(-2.0, 0.0, 0.5), Vec3::new(5.0, 6.0, 1.5)));
+                for y in [-2.8, 2.8] {
+                    r.spawn(part(&art.cube, &art.rocket_tip, at + Vec3::new(8.5, y, 3.0), Vec3::new(3.0, 3.6, 3.6)));
+                }
+            })
+            .id();
+        // A stack of mines on the back.
+        let mines = commands
+            .spawn((WeaponMount(Weapon::Mines), Transform::default(), Visibility::Hidden))
+            .with_children(|m| {
+                for (k, x) in [-0.5, 0.5].into_iter().enumerate() {
+                    let at = spots.mines + Vec3::new(x * 6.0, 0.0, 1.2 + k as f32 * 2.6);
+                    m.spawn(part(&art.disc, &art.mine_red, at, Vec3::new(5.0, 5.0, 2.4)));
+                    m.spawn(part(&art.disc, &art.mine_light, at + Vec3::Z * 1.3, Vec3::new(1.5, 1.5, 0.4)));
+                }
+            })
+            .id();
+        commands.entity(root).add_children(&[guns, rockets, mines]);
+    }
+}
+
+/// Show the weapon a car carries on the car itself.
+fn show_weapon_mounts(cars: Query<&Armory>, mut mounts: Query<(&WeaponMount, &ChildOf, &mut Visibility)>) {
+    for (mount, parent, mut vis) in &mut mounts {
+        let Ok(armory) = cars.get(parent.parent()) else { continue };
+        let want = if armory.weapon == mount.0 { Visibility::Inherited } else { Visibility::Hidden };
+        if *vis != want {
+            *vis = want;
         }
     }
 }
@@ -3326,6 +3456,140 @@ fn camera_follow(
     }
 }
 
+/// The HUD: race (or derby) standing top left, lap top centre, weapon top
+/// right, health bottom left, controls bottom centre for the first seconds,
+/// and the pop-up line in the middle.
+fn spawn_hud(commands: &mut Commands) {
+    let shadow = TextShadow { offset: Vec2::new(2.0, 2.0), color: Color::srgba(0.0, 0.0, 0.0, 0.8) };
+    let text = |part: Hud, size: f32, color: Color| {
+        (part, Text::new(""), TextFont { font_size: FontSize::Px(size), ..default() }, TextColor(color), shadow)
+    };
+    let corner = |node: Node| (RoundEntity, Node { position_type: PositionType::Absolute, ..node });
+    // A soft dark panel behind the standings, so they read over anything.
+    commands
+        .spawn((
+            corner(Node {
+                top: px(10),
+                left: px(12),
+                flex_direction: FlexDirection::Column,
+                padding: UiRect::new(px(12), px(14), px(2), px(8)),
+                border_radius: BorderRadius::all(px(10)),
+                ..default()
+            }),
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.4)),
+        ))
+        .with_children(|c| {
+            c.spawn(text(Hud::Main, 46.0, Color::WHITE));
+            c.spawn(text(Hud::Sub, 20.0, Color::srgb(0.85, 0.85, 0.85)));
+        });
+    commands
+        .spawn(corner(Node { top: px(12), width: percent(100), justify_content: JustifyContent::Center, ..default() }))
+        .with_children(|c| {
+            c.spawn(text(Hud::Lap, 40.0, Color::srgb(0.95, 0.8, 0.3)));
+        });
+    commands
+        .spawn(corner(Node { top: px(16), right: px(16), column_gap: px(8), ..default() }))
+        .with_children(|c| {
+            let badge = |part: Hud, color: Color| {
+                (
+                    part,
+                    Node {
+                        padding: UiRect::axes(px(12), px(5)),
+                        border_radius: BorderRadius::all(px(7)),
+                        ..default()
+                    },
+                    BackgroundColor(color),
+                    Visibility::Hidden,
+                )
+            };
+            c.spawn(badge(Hud::Turbo, Color::srgba(0.15, 0.6, 0.85, 0.9))).with_children(|b| {
+                b.spawn((Text::new("TURBO"), TextFont { font_size: FontSize::Px(22.0), ..default() }, TextColor(Color::WHITE)));
+            });
+            c.spawn(badge(Hud::WeaponBadge, Color::BLACK)).with_children(|b| {
+                b.spawn((
+                    Hud::WeaponText,
+                    Text::new(""),
+                    TextFont { font_size: FontSize::Px(22.0), ..default() },
+                    TextColor(Color::srgb(0.08, 0.08, 0.08)),
+                ));
+            });
+        });
+    commands
+        .spawn(corner(Node { bottom: px(16), left: px(16), align_items: AlignItems::Center, column_gap: px(10), ..default() }))
+        .with_children(|c| {
+            c.spawn((Text::new("HP"), TextFont { font_size: FontSize::Px(20.0), ..default() }, TextColor(Color::WHITE), shadow));
+            c.spawn((
+                Node {
+                    width: px(220),
+                    height: px(18),
+                    padding: UiRect::all(px(3)),
+                    border: UiRect::all(px(1)),
+                    border_radius: BorderRadius::all(px(4)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.55)),
+                BorderColor::all(Color::srgba(1.0, 1.0, 1.0, 0.35)),
+            ))
+            .with_children(|track| {
+                track.spawn((
+                    Hud::Health,
+                    Node { width: percent(100), height: percent(100), border_radius: BorderRadius::all(px(2)), ..default() },
+                    BackgroundColor(Color::srgb(0.3, 0.85, 0.3)),
+                ));
+            });
+        });
+    commands
+        .spawn(corner(Node { bottom: px(52), width: percent(100), justify_content: JustifyContent::Center, ..default() }))
+        .with_children(|c| {
+            c.spawn(text(Hud::Help, 18.0, Color::srgb(0.85, 0.85, 0.85)));
+        });
+    commands
+        .spawn(corner(Node { top: percent(22), width: percent(100), justify_content: JustifyContent::Center, ..default() }))
+        .with_children(|c| {
+            c.spawn((
+                AnnouncementText,
+                Text::new(""),
+                TextFont { font_size: FontSize::Px(48.0), ..default() },
+                TextColor(Color::srgb(0.95, 0.8, 0.3)),
+                shadow,
+            ));
+        });
+}
+
+/// Show pop-up messages one after another, fading in and out.
+fn show_announcements(
+    time: Res<Time>,
+    mut news: ResMut<Announcements>,
+    mut text: Query<(&mut Text, &mut TextColor), With<AnnouncementText>>,
+) {
+    let Ok((mut text, mut color)) = text.single_mut() else {
+        news.queue.clear();
+        news.showing = None;
+        return;
+    };
+    // Hurry along when messages pile up.
+    let speed = if news.queue.len() > 1 { 2.0 } else { 1.0 };
+    if let Some((_, age)) = &mut news.showing {
+        *age += time.delta_secs() * speed;
+        if *age > ANNOUNCE_SECS {
+            news.showing = None;
+        }
+    }
+    if news.showing.is_none()
+        && let Some(next) = news.queue.pop_front()
+    {
+        news.showing = Some((next, 0.0));
+    }
+    let (want, alpha) = match &news.showing {
+        Some((msg, age)) => (msg.clone(), (age / 0.15).min(1.0).min((ANNOUNCE_SECS - age) / 0.4)),
+        None => (String::new(), 0.0),
+    };
+    if text.0 != want {
+        text.0 = want;
+    }
+    color.0.set_alpha(alpha.clamp(0.0, 1.0));
+}
+
 fn race_time(t: f32) -> String {
     format!("{}:{:04.1}", (t / 60.0) as u32, t % 60.0)
 }
@@ -3337,52 +3601,91 @@ fn update_hud(
     race: Option<Res<Race>>,
     cars: Query<(Entity, &Car, &Armory, Has<Player>, Option<&Racer>)>,
     last: Res<LastInput>,
-    mut hud: Query<&mut Text, With<Hud>>,
+    mut texts: Query<(&Hud, &mut Text)>,
+    mut nodes: Query<(&Hud, &mut Node, &mut BackgroundColor, &mut Visibility), Without<Text>>,
 ) {
-    let Ok(mut text) = hud.single_mut() else { return };
-    let help = match last.0 {
-        InputDevice::Keyboard => "W/S or arrows drive  |  Space handbrake  |  Ctrl or F/C/V fire  |  Esc menu",
-        InputDevice::Gamepad => "Left stick or RT/LT drive  |  B/LB handbrake  |  A/RB fire  |  Start menu",
-    };
     let Some((player, car, armory, _, racer)) = cars.iter().find(|(.., p, _)| *p) else { return };
+    let clock = race.as_ref().map_or(0.0, |r| r.clock);
+    let started = race.as_ref().is_none_or(|r| r.started());
 
-    let weapon_text = if armory.weapon == Weapon::None {
-        armory.weapon.name().to_string()
-    } else {
-        format!("{} x{}", armory.weapon.name(), armory.ammo)
-    };
-    let turbo_text = if armory.turbo > 0.0 { format!("   TURBO {:.1}s", armory.turbo) } else { String::new() };
-    let status = match (&track, &race, racer) {
-        (Some(track), Some(race), Some(racer)) => {
+    let (main, sub, lap) = match (&track, racer) {
+        (Some(track), Some(racer)) => {
             let order = race_order(cars.iter().filter_map(|(e, c, _, _, r)| r.map(|r| (e, c, r))));
             let place = order.iter().position(|&e| e == player).unwrap_or(0) + 1;
             let lap = (racer.laps_done(track) + 1).min(track.laps);
-            let best = racer.best_lap.map_or("-".to_string(), race_time);
-            format!(
-                "POS {place}/{}   LAP {lap}/{}   TIME {}   BEST {best}",
-                order.len(),
-                track.laps,
-                race_time(race.clock),
-            )
+            let best = racer.best_lap.map_or(String::new(), |b| format!("   best {}", race_time(b)));
+            (format!("{} / {}", ordinal(place), order.len()), format!("{}{best}", race_time(clock)), format!("LAP {lap}/{}", track.laps))
         }
-        _ => format!(
-            "Rivals {}   Wrecked {}   Score {:.0}",
-            cars.iter().filter(|(_, c, _, p, _)| !p && c.alive()).count(),
-            score.wrecks,
-            total_score(&score)
-        ),
+        _ => {
+            let rivals = cars.iter().filter(|(_, c, _, p, _)| !p && c.alive()).count();
+            let left = if rivals == 1 { "1 rival left".to_string() } else { format!("{rivals} rivals left") };
+            (left, format!("{} wrecked   score {:.0}", score.wrecks, total_score(&score)), String::new())
+        }
     };
+    let help = if !started || clock < 5.0 {
+        match last.0 {
+            InputDevice::Keyboard => "W/S or arrows drive  |  Space handbrake  |  Ctrl or F/C/V fire  |  Esc menu",
+            InputDevice::Gamepad => "Left stick or RT/LT drive  |  B/LB handbrake  |  A/RB fire  |  Start menu",
+        }
+    } else {
+        ""
+    };
+    let weapon = match armory.weapon {
+        Weapon::None => String::new(),
+        w => format!("{}  x{}", w.name().to_uppercase(), armory.ammo),
+    };
+    for (part, mut text) in &mut texts {
+        let want: &str = match part {
+            Hud::Main => &main,
+            Hud::Sub => &sub,
+            Hud::Lap => &lap,
+            Hud::WeaponText => &weapon,
+            Hud::Help => help,
+            _ => continue,
+        };
+        if text.0 != want {
+            text.0 = want.to_string();
+        }
+    }
 
-    text.0 = format!(
-        "{}  HP {:>3.0}/{:.0}   Weapon {}{}   {}\n{}",
-        car.model.name,
-        car.hp.max(0.0),
-        car.model.max_hp,
-        weapon_text,
-        turbo_text,
-        status,
-        help,
-    );
+    let health = car.health();
+    let weapon_color = match armory.weapon {
+        Weapon::None => Color::NONE,
+        Weapon::Guns => PickupKind::Guns.color(),
+        Weapon::Rockets => PickupKind::Rockets.color(),
+        Weapon::Mines => PickupKind::Mines.color(),
+    };
+    for (part, mut node, mut bg, mut vis) in &mut nodes {
+        let show = |on: bool| if on { Visibility::Inherited } else { Visibility::Hidden };
+        match part {
+            Hud::Health => {
+                let width = percent(health * 100.0);
+                if node.width != width {
+                    node.width = width;
+                }
+                let color = Color::srgb((1.0 - health) * 1.6, health * 1.1, 0.2);
+                if bg.0 != color {
+                    bg.0 = color;
+                }
+            }
+            Hud::WeaponBadge => {
+                let want = show(armory.weapon != Weapon::None);
+                if *vis != want {
+                    *vis = want;
+                }
+                if bg.0 != weapon_color {
+                    bg.0 = weapon_color;
+                }
+            }
+            Hud::Turbo => {
+                let want = show(armory.turbo > 0.0);
+                if *vis != want {
+                    *vis = want;
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn total_score(score: &Score) -> f32 {
